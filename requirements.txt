@@ -1,0 +1,14 @@
+chromadb==1.5.9
+langchain-chroma==0.2.6
+langchain-community==0.3.31
+langchain-core==0.3.86
+langchain-huggingface==0.3.1
+langchain-text-splitters==0.3.11
+python-dotenv==1.2.1
+PyMuPDF==1.26.5
+sentence-transformers==3.3.1
+torch==2.2.2
+transformers==4.41.2
+numpy==1.26.4
+anthropic==0.109.1
+streamlit==1.50.0
