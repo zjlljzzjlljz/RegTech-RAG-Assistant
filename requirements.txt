@@ -12,3 +12,7 @@ transformers==4.41.2
 numpy==1.26.4
 anthropic==0.109.1
 streamlit==1.50.0
+llama-index-core==0.12.52
+llama-index-embeddings-huggingface==0.5.5
+llama-index-readers-file==0.4.11
+rank-bm25==0.2.2
