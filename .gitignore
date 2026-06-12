@@ -5,3 +5,4 @@ __pycache__/
 chroma_db/
 .DS_Store
 .superpowers/
+*.log
