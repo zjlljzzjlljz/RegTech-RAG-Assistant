@@ -6,3 +6,5 @@ chroma_db/
 .DS_Store
 .superpowers/
 *.log
+comparison_results.json
+langgraph_install.log

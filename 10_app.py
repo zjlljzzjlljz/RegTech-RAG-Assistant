@@ -1064,7 +1064,6 @@ def main() -> None:
         _ = get_anthropic_client()
     except Exception as exc:  # noqa: BLE001
         # Diagnostic: show what env vars look like
-        import os
         key_val = (os.getenv("ANTHROPIC_API_KEY") or "")
         url_val = (os.getenv("ANTHROPIC_BASE_URL") or "")
         st.error("Anthropic client initialization failed. Please verify your `.env` configuration.")

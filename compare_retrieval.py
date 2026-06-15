@@ -1,3 +1,16 @@
+import sys
+
+# -----------------------------
+# SQLite3 兼容性猴子补丁
+# -----------------------------
+# 必须放在文件最顶部，并且早于 chromadb / langchain 相关导入。
+# 目的：在本地系统 sqlite3 版本过低时，优先尝试切换到 pysqlite3。
+try:
+    __import__("pysqlite3")
+    sys.modules["sqlite3"] = sys.modules.pop("pysqlite3")
+except ImportError:
+    pass
+
 import importlib.util
 import json
 import time
@@ -41,7 +54,7 @@ def build_old_vector_store() -> Chroma:
         encode_kwargs={"normalize_embeddings": True},
     )
     return Chroma(
-        collection_name="regtech_pdf_docs",
+        collection_name="regtech_parent_child_docs",
         persist_directory=str(DB_DIR),
         embedding_function=embeddings,
     )
@@ -129,8 +142,13 @@ def main() -> int:
             }
         )
 
-    OUTPUT_JSON_PATH.write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(f"\nSaved structured results to: {OUTPUT_JSON_PATH}")
+    try:
+        OUTPUT_JSON_PATH.write_text(json.dumps(all_results, ensure_ascii=False, indent=2), encoding="utf-8")
+        print(f"\nSaved structured results to: {OUTPUT_JSON_PATH}")
+    except OSError as exc:
+        print(f"\nWarning: failed to write structured results to {OUTPUT_JSON_PATH}: {exc}")
+    except Exception as exc:  # noqa: BLE001
+        print(f"\nWarning: unexpected error while writing structured results to {OUTPUT_JSON_PATH}: {exc}")
     return 0
 
 
