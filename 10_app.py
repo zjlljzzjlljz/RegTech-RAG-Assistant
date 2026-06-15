@@ -792,6 +792,19 @@ def run_audited_compliance_report(
 
     MAX_ROUNDS = 3
 
+    def render_audit_trail_info() -> None:
+        """在预留的聊天容器中直接展示 audit trail，避免重渲染导致的外层容器丢失。"""
+        if not audit_trail:
+            st.session_state["audit_trail_rendered"] = False
+            return
+
+        chat_display.info("📋 AUDIT TRAIL")
+        for step in audit_trail:
+            icon = "✅" if step["status"] == "approved" else "🔄"
+            chat_display.write(f"{icon} **{step['phase']}** (Round {step['iteration']}) — {step['status'].upper()}")
+            chat_display.caption(step["content_preview"][:200])
+        st.session_state["audit_trail_rendered"] = True
+
     for iteration in range(1, MAX_ROUNDS + 1):
         # ── DRAFTING PHASE ────────────────────────────────────────────────────
         try:
@@ -831,6 +844,7 @@ def run_audited_compliance_report(
                 "status": "error",
                 "content_preview": str(exc)[:300],
             })
+            render_audit_trail_info()
             # Return last available draft (if any); caller will fall back to streaming when empty
             return draft, audit_trail
 
@@ -883,9 +897,11 @@ def run_audited_compliance_report(
                 "status": "error",
                 "content_preview": str(exc)[:300],
             })
+            render_audit_trail_info()
             # If auditor fails, we still have a draft — return it rather than crashing
             return draft, audit_trail
 
+    render_audit_trail_info()
     return draft, audit_trail
 
 
@@ -905,6 +921,7 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("last_fallback_note", "")
     st.session_state.setdefault("last_attempt_failures", [])
     st.session_state.setdefault("last_retrieval_path", FAST_PATH_LABEL)
+    st.session_state.setdefault("audit_trail_rendered", False)
 
 
 def clear_chat_state() -> None:
@@ -918,6 +935,7 @@ def clear_chat_state() -> None:
     st.session_state["last_fallback_note"] = ""
     st.session_state["last_attempt_failures"] = []
     st.session_state["last_retrieval_path"] = FAST_PATH_LABEL
+    st.session_state["audit_trail_rendered"] = False
 
 
 
@@ -985,6 +1003,15 @@ def render_chat_history() -> None:
     for item in st.session_state["chat_history"]:
         with st.chat_message(item["role"]):
             st.markdown(item["text"])
+
+            audit_trail = item.get("audit_trail") or []
+            if item.get("mode") == AUDIT_MODE and audit_trail:
+                st.info("📋 AUDIT TRAIL")
+                for step in audit_trail:
+                    icon = "✅" if step["status"] == "approved" else "🔄"
+                    st.write(f"{icon} **{step['phase']}** (Round {step['iteration']}) — {step['status'].upper()}")
+                    st.caption(step["content_preview"][:200])
+
             citations = item.get("citations") or []
             citations_markdown = render_citations_markdown(citations)
             if citations_markdown:
@@ -1103,15 +1130,22 @@ def main() -> None:
         return
 
     st.session_state["last_evidence"] = evidence_records
+    st.session_state["audit_trail_rendered"] = False
 
     # ── PART E — Audit mode branch ─────────────────────────────────────────────
     if mode == AUDIT_MODE:
         with chat_column:
+            with st.chat_message("assistant"):
+                report_title_slot = st.empty()
+                report_body_slot = st.empty()
+                trail_slot = st.container()
+                citations_slot = st.container()
+
             try:
                 final_draft, audit_trail = run_audited_compliance_report(
                     query=user_query,
                     evidence_records=evidence_records,
-                    chat_display=chat_column,
+                    chat_display=trail_slot,
                 )
             except Exception as exc:  # noqa: BLE001
                 logger.exception("Audit flow failed with fallback to streaming: %s", exc)
@@ -1121,31 +1155,23 @@ def main() -> None:
                 audit_trail = []
 
             if final_draft:
-                with st.chat_message("assistant"):
-                    st.markdown("### Audited Compliance Report")
-                    st.markdown(final_draft)
+                report_title_slot.markdown("### Audited Compliance Report")
+                report_body_slot.markdown(final_draft)
 
-                    if audit_trail:
-                        with st.expander("Audit Trail (click to expand)"):
-                            for step in audit_trail:
-                                icon = "✅" if step["status"] == "approved" else "🔄"
-                                status_label = step["status"].upper()
-                                st.write(
-                                    f"{icon} **{step['phase'].capitalize()}** "
-                                    f"(Round {step['iteration']}) — {status_label}"
-                                )
-                                st.caption(step["content_preview"][:200])
+                if not st.session_state.get("audit_trail_rendered"):
+                    trail_slot.caption("_Audit trail was not rendered inside the audit loop._")
 
-                    citations = select_citations(answer_text=final_draft, evidence_records=evidence_records)
-                    citations_markdown = render_citations_markdown(citations)
-                    if citations_markdown:
-                        st.markdown(citations_markdown)
+                citations = select_citations(answer_text=final_draft, evidence_records=evidence_records)
+                citations_markdown = render_citations_markdown(citations)
+                if citations_markdown:
+                    citations_slot.markdown(citations_markdown)
 
                 st.session_state["chat_history"].append({
                     "role": "assistant",
                     "text": final_draft,
                     "mode": AUDIT_MODE,
                     "citations": citations if final_draft else [],
+                    "audit_trail": audit_trail,
                 })
             else:
                 # If audit produced nothing, fall back to streaming response
