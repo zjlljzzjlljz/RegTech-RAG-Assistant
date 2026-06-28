@@ -1,3 +1,5 @@
+# ARCHIVED — 2024 实验版本，当前入口为 app.py
+
 import importlib.util
 import logging
 import time

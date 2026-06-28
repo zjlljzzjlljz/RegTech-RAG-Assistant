@@ -1,0 +1,223 @@
+[
+  {
+    "query": "香港金融机构对客户的尽职审查有什么具体要求？",
+    "ground_truth_chunk_ids": [
+      "page-19-parent-0",
+      "page-19-parent-0-child-0"
+    ],
+    "ground_truth_answer": "香港金融机构须按照 AMLO 和 HKMA 指引执行客户尽职审查，至少包括识别及核实客户与实益拥有人身份、了解业务关系目的，并在法定触发情形下开展相应审查。"
+  },
+  {
+    "query": "在什么情况下授权机构必须执行客户尽职审查，包括偶发交易门槛？",
+    "ground_truth_chunk_ids": [
+      "page-20-parent-0",
+      "page-20-parent-0-child-0",
+      "page-20-parent-0-child-1"
+    ],
+    "ground_truth_answer": "授权机构在建立业务关系、进行达到法定门槛的偶发交易、怀疑涉及洗钱或恐怖分子资金筹集，或对先前取得的客户识别资料存疑时，必须执行客户尽职审查。"
+  },
+  {
+    "query": "金融机构如何识别并核实法人客户的实益拥有人？",
+    "ground_truth_chunk_ids": [
+      "page-28-parent-0",
+      "page-28-parent-0-child-0"
+    ],
+    "ground_truth_answer": "对于法人客户，机构应识别最终拥有或控制该法人的自然人，以及通过其他方式行使控制权的自然人，并采取合理措施核实其身份。"
+  },
+  {
+    "query": "HKMA要求高风险客户采取哪些强化尽职审查措施？",
+    "ground_truth_chunk_ids": [
+      "page-40-parent-0",
+      "page-40-parent-0-child-0"
+    ],
+    "ground_truth_answer": "对高风险客户，机构应采取强化尽职审查，例如取得更多客户资料、了解建立关系的目的、了解财富来源与资金来源，并在适当时要求首笔付款经客户本人名下账户进行。"
+  },
+  {
+    "query": "对非香港政治人物（non-Hong Kong PEP），开户或维持关系前需要哪些额外审批和核查？",
+    "ground_truth_chunk_ids": [
+      "page-41-parent-0",
+      "page-41-parent-0-child-0"
+    ],
+    "ground_truth_answer": "若客户或实益拥有人属于 non-Hong Kong PEP，机构应采取合理措施识别其身份，取得高级管理层批准，并采取合理措施查明其财富来源及资金来源，同时实施强化持续监控。"
+  },
+  {
+    "query": "对前任 non-Hong Kong PEP，是否必须持续适用 PEP 强化措施？",
+    "ground_truth_chunk_ids": [
+      "page-42-parent-0",
+      "page-42-parent-0-child-0"
+    ],
+    "ground_truth_answer": "对于前任 non-Hong Kong PEP，机构可在风险为本评估后决定不再继续适用针对现任 PEP 的强化措施，但前提是其已不再呈现较高洗钱或恐怖分子资金筹集风险。"
+  },
+  {
+    "query": "授权机构应如何开展持续交易监控以识别异常或复杂交易？",
+    "ground_truth_chunk_ids": [
+      "page-57-parent-0",
+      "page-57-parent-0-child-0"
+    ],
+    "ground_truth_answer": "授权机构应持续监控客户交易，识别复杂、金额异常大、缺乏明显经济或合法目的，或与客户风险状况不一致的交易，并在需要时进行审查与跟进。"
+  },
+  {
+    "query": "在高风险与低风险场景下，交易监控强度应如何调整？",
+    "ground_truth_chunk_ids": [
+      "page-57-parent-0",
+      "page-57-parent-0-child-0"
+    ],
+    "ground_truth_answer": "在高风险情形下，机构应加强交易监控；在低风险情形下，可适度降低监控范围或频率，但仍须足以发现异常交易和可疑活动。"
+  },
+  {
+    "query": "提交可疑交易报告后，机构还应对客户关系采取什么后续风险缓释措施？",
+    "ground_truth_chunk_ids": [
+      "page-68-parent-0",
+      "page-68-parent-0-child-0"
+    ],
+    "ground_truth_answer": "提交可疑交易报告并不意味着机构可以不再处理相关风险；机构仍应结合 JFIU 后续反馈持续评估客户关系风险，并采取适当的风险缓释措施。"
+  },
+  {
+    "query": "HKMA对制裁名单筛查的频率和范围有什么规定？",
+    "ground_truth_chunk_ids": [
+      "page-61-parent-0",
+      "page-61-parent-0-child-0",
+      "page-62-parent-0",
+      "page-62-parent-0-child-0"
+    ],
+    "ground_truth_answer": "授权机构应维持最新的制裁和恐怖分子名单数据库，并按风险为本方法对客户、相关方及交易开展持续筛查；一旦发现可能匹配，应及时调查、升级和控制相关交易。"
+  },
+  {
+    "query": "制裁及恐怖分子筛查是否需要覆盖关联方和受益人？",
+    "ground_truth_chunk_ids": [
+      "page-62-parent-0",
+      "page-62-parent-0-child-0"
+    ],
+    "ground_truth_answer": "需要。筛查范围可按风险为本方法扩展至 connected parties 以及客户的实益拥有人、被授权签字人或其他相关控制方，以降低规避制裁风险。"
+  },
+  {
+    "query": "当出现可能姓名匹配时，授权机构应如何处理和升级？",
+    "ground_truth_chunk_ids": [
+      "page-62-parent-0",
+      "page-62-parent-0-child-0"
+    ],
+    "ground_truth_answer": "出现可能姓名匹配时，机构应有有效流程及时甄别真伪匹配、必要时冻结或阻止相关交易，并向适当的内部职能及监管或执法渠道升级处理。"
+  },
+  {
+    "query": "跨境代理行关系建立前，授权机构需要对 respondent bank 做哪些尽职审查？",
+    "ground_truth_chunk_ids": [
+      "page-81-parent-0",
+      "page-81-parent-0-child-0",
+      "page-82-parent-0",
+      "page-82-parent-0-child-0"
+    ],
+    "ground_truth_answer": "建立跨境代理行关系前，授权机构应了解 respondent bank 的业务性质、声誉、所在司法管辖区监管情况和 AML/CFT 控制，并评估其控制是否足够有效。"
+  },
+  {
+    "query": "在未完成尽职审查前，授权机构能否建立 correspondent banking 关系？",
+    "ground_truth_chunk_ids": [
+      "page-83-parent-0",
+      "page-83-parent-0-child-0"
+    ],
+    "ground_truth_answer": "不能。若未完成对应的尽职审查措施，授权机构不应建立跨境代理行或类似关系。"
+  },
+  {
+    "query": "集团总行或海外分行代为完成跨境代理行尽调时，香港机构仍需满足哪些条件？",
+    "ground_truth_chunk_ids": [
+      "page-85-parent-0",
+      "page-85-parent-0-child-0"
+    ],
+    "ground_truth_answer": "即使依赖集团总行、母行或海外分行协助完成跨境代理行尽调，香港机构仍须确保相关审查符合本地 AML/CFT 要求、资料可及时取得，并由集团层面维持适当控制。"
+  },
+  {
+    "query": "香港银行业如何应用 RegTech 提升 AML/CFT 合规？",
+    "ground_truth_chunk_ids": [
+      "page-1-parent-0",
+      "page-1-parent-0-child-0",
+      "page-2-parent-0",
+      "page-2-parent-0-child-0",
+      "page-3-parent-0",
+      "page-3-parent-0-child-0"
+    ],
+    "ground_truth_answer": "香港银行业可利用 RegTech 提升 AML/CFT 合规效率，例如通过自动化数据分析、规则引擎、机器学习监控和更高效的预警分流来增强识别、调查和报告可疑活动的能力。"
+  },
+  {
+    "query": "远程个人客户开户需要哪些 AML 控制措施？",
+    "ground_truth_chunk_ids": [
+      "page-1-parent-0",
+      "page-1-parent-0-child-0",
+      "page-2-parent-0",
+      "page-2-parent-0-child-0"
+    ],
+    "ground_truth_answer": "远程个人开户应采用与面对面开户同样稳健或更稳健的控制，包括身份认证、身份匹配、风险评估、文件核实及持续监控；无法可靠完成识别时，不应继续开户。"
+  },
+  {
+    "query": "人工智能在可疑交易监控中的应用需满足什么监管要求？",
+    "ground_truth_chunk_ids": [
+      "page-1-parent-0",
+      "page-1-parent-0-child-0",
+      "page-57-parent-0",
+      "page-57-parent-0-child-0",
+      "page-61-parent-0",
+      "page-61-parent-0-child-0"
+    ],
+    "ground_truth_answer": "在可疑交易监控中使用人工智能时，机构仍需满足既有 AML/CFT 监管要求，包括治理责任明确、模型有效性验证、审计轨迹保留、持续监测误报与漏报，以及对高风险案例保有人类复核。"
+  },
+  {
+    "query": "授权机构的 AML/CFT 治理框架应包含哪些基本要素？",
+    "ground_truth_chunk_ids": [
+      "page-14-parent-0",
+      "page-14-parent-0-child-0",
+      "page-15-parent-0",
+      "page-15-parent-0-child-0",
+      "page-17-parent-0",
+      "page-17-parent-0-child-0",
+      "page-18-parent-0",
+      "page-18-parent-0-child-0"
+    ],
+    "ground_truth_answer": "授权机构的 AML/CFT 治理框架应包括董事会及高级管理层监督、清晰的政策和程序、合规与监控职能、客户尽职审查、交易监控、记录保存、员工培训和独立审计等要素。"
+  },
+  {
+    "query": "员工 AML/CFT 培训应覆盖哪些核心内容？",
+    "ground_truth_chunk_ids": [
+      "page-74-parent-0",
+      "page-74-parent-0-child-0"
+    ],
+    "ground_truth_answer": "员工 AML/CFT 培训应覆盖机构政策、识别可疑交易的方法、内部上报路径、避免 tipping-off 的要求，以及不同岗位在 AML/CFT 控制框架中的职责。"
+  },
+  {
+    "query": "前线员工在可疑交易识别和内部上报方面应接受什么培训？",
+    "ground_truth_chunk_ids": [
+      "page-74-parent-0",
+      "page-74-parent-0-child-0"
+    ],
+    "ground_truth_answer": "前线员工应接受识别可疑交易、及时向 MLRO 或指定渠道内部上报、理解 tipping-off 风险，以及在客户接触场景中落实机构 AML/CFT 策略的专门培训。"
+  },
+  {
+    "query": "为什么 AML/CFT 记录保存被视为关键审计轨迹？",
+    "ground_truth_chunk_ids": [
+      "page-70-parent-0",
+      "page-70-parent-0-child-0"
+    ],
+    "ground_truth_answer": "记录保存是 AML/CFT 审计轨迹的重要组成部分，有助于识别、调查及追缴犯罪或恐怖分子相关财产，也便于监管机构和执法机关重建交易和客户关系。"
+  },
+  {
+    "query": "机构需要保存哪些客户尽职调查和业务往来记录？",
+    "ground_truth_chunk_ids": [
+      "page-71-parent-0",
+      "page-71-parent-0-child-0"
+    ],
+    "ground_truth_answer": "机构应保存客户尽职调查记录、风险评估资料、与客户及实益拥有人相关的重要业务往来记录，以及与客户资料重大变化相关的文件，以支持后续审查和调查。"
+  },
+  {
+    "query": "如果 CDD 和交易记录存放在香港以外地点，机构仍需满足什么要求？",
+    "ground_truth_chunk_ids": [
+      "page-72-parent-0",
+      "page-72-parent-0-child-0"
+    ],
+    "ground_truth_answer": "即使 CDD 和交易记录存放在香港以外地点，授权机构仍须遵守香港适用的 AML/CFT 法律和监管要求，并确保有关记录可在监管或执法需要时及时取得。"
+  },
+  {
+    "query": "机构保存 AML/CFT 记录时，应如何确保监管机构能够及时取得资料？",
+    "ground_truth_chunk_ids": [
+      "page-72-parent-0",
+      "page-72-parent-0-child-0"
+    ],
+    "ground_truth_answer": "机构应确保保存方式不会妨碍香港监管和执法要求，相关记录无论由内部单位、集团成员还是第三方持有，都应能够在需要时及时提供给有关当局。"
+  }
+]

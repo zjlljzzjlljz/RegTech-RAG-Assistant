@@ -1,3 +1,5 @@
+# ARCHIVED — 2024 实验版本，当前入口为 app.py
+
 import sys
 
 # -----------------------------
@@ -11,6 +13,7 @@ try:
 except ImportError:
     pass
 
+import importlib.util
 import logging
 import os
 import re
@@ -22,19 +25,18 @@ import anthropic
 import chromadb
 import streamlit as st
 from dotenv import load_dotenv
-from langchain_chroma import Chroma
-from langchain_huggingface import HuggingFaceEmbeddings
 
 # -----------------------------
 # 全局配置常量
 # -----------------------------
 APP_TITLE = "RegTech RAG Assistant"
-COLLECTION_NAME = "regtech_pdf_docs"
+COLLECTION_NAME = "regtech_parent_child_docs"
 EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 MODEL_NAME = os.getenv("ANTHROPIC_MODEL", "claude-fable-5")
 MIN_SQLITE_VERSION = (3, 35, 0)
 STRICT_MODE = "Strict Grounding"
 BACKGROUND_MODE = "Allow Background Knowledge"
+AUDIT_MODE = "Audited Compliance Report"
 DEFAULT_TOP_K = 4
 MAX_HISTORY_MESSAGES = 12
 MAX_TOKENS = 4000
@@ -43,6 +45,11 @@ MODEL_FALLBACK_STANDARD_SONNET = os.getenv("ANTHROPIC_FALLBACK_SONNET", "claude-
 MODEL_FALLBACK_STANDARD_HAIKU = os.getenv("ANTHROPIC_FALLBACK_HAIKU", "claude-fable-5")
 
 logger = logging.getLogger(__name__)
+_cross_encoder_module: Optional[Any] = None
+_hyde_module: Optional[Any] = None
+_audit_module: Optional[Any] = None
+FAST_PATH_LABEL = "Fast Path (Cross-Encoder)"
+RESCUE_PATH_LABEL = "Rescue Path (HyDE + Cross-Encoder)"
 
 SYSTEM_PROMPT = """
 You are a business-formal RegTech research assistant.
@@ -248,7 +255,6 @@ def select_citations(answer_text: str, evidence_records: List[Dict[str, Any]]) -
     return deduplicate_citations(evidence_records)
 
 
-
 def render_citations_markdown(citations: List[Dict[str, Any]]) -> str:
     """把引用信息渲染为统一的 Markdown。"""
     if not citations:
@@ -400,27 +406,6 @@ def get_anthropic_client() -> anthropic.Anthropic:
 
 
 @st.cache_resource(show_spinner=False)
-def get_embeddings() -> HuggingFaceEmbeddings:
-    """缓存本地 embedding 模型，减少重复加载时间。"""
-    logger.info("Initializing local HuggingFace embeddings model: %s", EMBEDDING_MODEL_NAME)
-    return HuggingFaceEmbeddings(
-        model_name=EMBEDDING_MODEL_NAME,
-        model_kwargs={"device": "cpu"},
-        encode_kwargs={"normalize_embeddings": True},
-    )
-
-
-@st.cache_resource(show_spinner=False)
-def get_vector_store(db_dir: str) -> Chroma:
-    """缓存 Chroma 向量库连接。"""
-    return Chroma(
-        collection_name=COLLECTION_NAME,
-        persist_directory=db_dir,
-        embedding_function=get_embeddings(),
-    )
-
-
-@st.cache_resource(show_spinner=False)
 def get_collection_count(db_dir: str) -> int:
     """读取目标 collection 的 chunk 数量，用于启动健康检查。"""
     client = chromadb.PersistentClient(path=db_dir)
@@ -429,16 +414,134 @@ def get_collection_count(db_dir: str) -> int:
 
 
 
-def retrieve_evidence(query: str, top_k: int, db_dir: Path) -> List[Dict[str, Any]]:
-    """
-    从本地 ChromaDB 检索与当前问题最相关的文档块。
+def load_module(module_path: Path, module_name: str) -> Any:
+    """通过 importlib 从脚本路径加载模块。"""
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"Unable to load module from: {module_path}")
 
-    这里只返回当前轮需要的证据，不把原始 chunk 永久写入会话历史，
-    从而控制 token 增长并提升缓存稳定性。
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+
+def load_cross_encoder_module() -> Any:
+    """加载 6_cross_encoder_retrieval.py。"""
+    global _cross_encoder_module
+
+    if _cross_encoder_module is None:
+        module_path = Path(__file__).resolve().parent / "6_cross_encoder_retrieval.py"
+        _cross_encoder_module = load_module(module_path=module_path, module_name="cross_encoder_retrieval_module")
+
+    return _cross_encoder_module
+
+
+
+def load_hyde_module() -> Any:
+    """加载 7_hyde_retrieval.py。"""
+    global _hyde_module
+
+    if _hyde_module is None:
+        module_path = Path(__file__).resolve().parent / "7_hyde_retrieval.py"
+        _hyde_module = load_module(module_path=module_path, module_name="hyde_retrieval_module")
+
+    return _hyde_module
+
+
+
+def load_audit_module() -> Any:
+    """加载 9_langgraph_agent.py，复用其 draftee_node、auditor_node、call_claude 等。"""
+    global _audit_module
+
+    if _audit_module is None:
+        module_path = Path(__file__).resolve().parent / "9_langgraph_agent.py"
+        _audit_module = load_module(module_path=module_path, module_name="langgraph_audit_module")
+
+    return _audit_module
+
+
+
+def get_draftee_function():
+    """返回 draftee_node 函数引用（来自 9_langgraph_agent.py）。"""
+    module = load_audit_module()
+    fn = getattr(module, "draftee_node", None)
+    if fn is None:
+        raise AttributeError("9_langgraph_agent.py does not define draftee_node")
+    return fn
+
+
+def get_auditor_function():
+    """返回 auditor_node 函数引用（来自 9_langgraph_agent.py）。"""
+    module = load_audit_module()
+    fn = getattr(module, "auditor_node", None)
+    if fn is None:
+        raise AttributeError("9_langgraph_agent.py does not define auditor_node")
+    return fn
+
+
+def get_call_claude_function():
+    """返回 call_claude 函数引用（来自 9_langgraph_agent.py）。"""
+    module = load_audit_module()
+    fn = getattr(module, "call_claude", None)
+    if fn is None:
+        raise AttributeError("9_langgraph_agent.py does not define call_claude")
+    return fn
+
+
+def get_render_evidence_context_function():
+    """返回 render_evidence_context 函数引用（来自 9_langgraph_agent.py）。"""
+    module = load_audit_module()
+    fn = getattr(module, "render_evidence_context", None)
+    if fn is None:
+        raise AttributeError("9_langgraph_agent.py does not define render_evidence_context")
+    return fn
+
+
+def get_cross_encoder_retrieve():
+    """返回 cross_encoder_retrieve 函数引用。"""
+    module = load_cross_encoder_module()
+    cross_encoder_retrieve = getattr(module, "cross_encoder_retrieve", None)
+    if cross_encoder_retrieve is None:
+        raise AttributeError("6_cross_encoder_retrieval.py does not define cross_encoder_retrieve")
+    return cross_encoder_retrieve
+
+
+def get_hyde_retrieve():
+    """返回 hyde_retrieve 函数引用。"""
+    module = load_hyde_module()
+    hyde_retrieve = getattr(module, "hyde_retrieve", None)
+    if hyde_retrieve is None:
+        raise AttributeError("7_hyde_retrieval.py does not define hyde_retrieve")
+    return hyde_retrieve
+
+
+
+def retrieve_evidence_adaptive(query: str, top_k: int, db_dir: Path) -> List[Dict[str, Any]]:
     """
-    vector_store = get_vector_store(str(db_dir))
-    documents_with_scores = vector_store.similarity_search_with_score(query, k=top_k)
-    return build_evidence_records(documents_with_scores)
+    优先走 Cross-Encoder 快速路径；若匹配分数不足，再触发 HyDE 救援路径。
+
+    检索路径会写入 session_state，供 sidebar 与 audit panel 复用。
+    """
+    cross_encoder_retrieve = get_cross_encoder_retrieve()
+    hyde_retrieve = get_hyde_retrieve()
+
+    results = cross_encoder_retrieve(query=query, db_dir=db_dir, top_k=max(top_k, 5))
+    top_ce_score = results[0]["score"] if results else -999.0
+
+    if top_ce_score >= 0:
+        st.session_state["last_retrieval_path"] = FAST_PATH_LABEL
+        return results[:top_k]
+
+    hyde_results = hyde_retrieve(query=query, db_dir=db_dir, top_k=max(top_k, 5))
+    top_hyde_score = hyde_results[0]["score"] if hyde_results else float("-inf")
+
+    if top_hyde_score > top_ce_score:
+        st.session_state["last_retrieval_path"] = RESCUE_PATH_LABEL
+        return hyde_results[:top_k]
+
+    st.session_state["last_retrieval_path"] = FAST_PATH_LABEL
+    return results[:top_k]
 
 
 
@@ -649,6 +752,166 @@ def stream_claude_answer(
 
 
 
+# ---------------------------------------------------------------------------
+# PART D — Audited Compliance Report (dual-agent draft/audit loop via importlib)
+# ---------------------------------------------------------------------------
+
+def run_audited_compliance_report(
+    query: str,
+    evidence_records: List[Dict[str, Any]],
+    chat_display: st.container,
+) -> Tuple[str, List[Dict[str, Any]]]:
+    """
+    Executes the dual-agent audit loop (draftee → auditor) with Streamlit progress display.
+
+    Imports the draft/audit logic from 9_langgraph_agent.py via importlib.
+    Non-streaming Claude calls — progress shown via st.status spinners per round.
+
+    Returns:
+        final_draft: the last approved or final draft text
+        audit_trail: list of audit step dicts with phase/iteration/status/content_preview
+    """
+    try:
+        audit_module = load_audit_module()
+        render_evidence_context = get_render_evidence_context_function()
+        call_claude = get_call_claude_function()
+        _ = get_draftee_function()
+        _ = get_auditor_function()
+        build_drafter_prompt = getattr(audit_module, "build_drafter_system_prompt")
+        auditor_system_prompt = getattr(audit_module, "AUDITOR_SYSTEM_PROMPT")
+    except AttributeError as exc:
+        logger.error("Failed to load audit functions from 9_langgraph_agent.py: %s", exc)
+        raise RuntimeError(
+            "9_langgraph_agent.py is missing required exports. "
+            "Please ensure it defines draftee_node, auditor_node, call_claude, render_evidence_context, build_drafter_system_prompt, and AUDITOR_SYSTEM_PROMPT."
+        ) from exc
+
+    evidence_context = render_evidence_context(evidence_records)
+    draft = ""
+    audit_feedback = ""
+    approved = False
+    audit_trail: List[Dict[str, Any]] = []
+
+    MAX_ROUNDS = 3
+
+    def render_audit_trail_info() -> None:
+        """在预留的聊天容器中直接展示 audit trail，避免重渲染导致的外层容器丢失。"""
+        if not audit_trail:
+            st.session_state["audit_trail_rendered"] = False
+            return
+
+        chat_display.info("📋 AUDIT TRAIL")
+        for step in audit_trail:
+            icon = "✅" if step["status"] == "approved" else "🔄"
+            chat_display.write(f"{icon} **{step['phase']}** (Round {step['iteration']}) — {step['status'].upper()}")
+            chat_display.caption(step["content_preview"][:200])
+        st.session_state["audit_trail_rendered"] = True
+
+    for iteration in range(1, MAX_ROUNDS + 1):
+        # ── DRAFTING PHASE ────────────────────────────────────────────────────
+        try:
+            with st.status(f"Round {iteration}/{MAX_ROUNDS} — Drafting compliance report...", expanded=True):
+                st.info("Generating compliance draft from evidence using Claude...")
+
+                system_prompt = build_drafter_prompt(audit_feedback)
+                user_content = (
+                    f"User Query:\n{query}\n\nEvidence:\n{evidence_context}"
+                )
+
+                draft = call_claude(
+                    system_prompt=system_prompt,
+                    user_content=user_content,
+                    max_tokens=2000,
+                )
+
+                if not draft:
+                    draft = "Draft generation returned empty content. Evidence may be insufficient or the model response was empty."
+
+                st.markdown("**Draft:**")
+                st.markdown(draft)
+
+            audit_trail.append({
+                "phase": "draftee",
+                "iteration": iteration,
+                "status": "ok",
+                "content_preview": draft[:300] if draft else "(empty)",
+            })
+
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Draftee call failed on iteration %d: %s", iteration, exc)
+            st.error(f"Draft generation interrupted: {exc}")
+            audit_trail.append({
+                "phase": "draftee",
+                "iteration": iteration,
+                "status": "error",
+                "content_preview": str(exc)[:300],
+            })
+            render_audit_trail_info()
+            # Return last available draft (if any); caller will fall back to streaming when empty
+            return draft, audit_trail
+
+        # ── AUDITING PHASE ─────────────────────────────────────────────────────
+        try:
+            auditor_user_content = (
+                f"Original Query:\n{query}\n\n"
+                f"Evidence:\n{evidence_context}\n\n"
+                f"Draft To Audit:\n{draft}"
+            )
+
+            with st.status(f"Round {iteration}/{MAX_ROUNDS} — Auditing compliance report...", expanded=True):
+                st.info("Auditing draft for compliance and source citation quality...")
+
+                audit_response = call_claude(
+                    system_prompt=auditor_system_prompt,
+                    user_content=auditor_user_content,
+                    max_tokens=500,
+                )
+
+            first_line = (audit_response or "").splitlines()[0].strip().upper()
+            approved = first_line == "APPROVED"
+
+            if approved:
+                st.success("✅ Audit PASSED — report approved for delivery.")
+                audit_trail.append({
+                    "phase": "auditor",
+                    "iteration": iteration,
+                    "status": "approved",
+                    "content_preview": audit_response[:300] if audit_response else "(empty)",
+                })
+                break
+            else:
+                audit_feedback = audit_response or "REJECTED\nNo actionable auditor feedback returned."
+                st.warning(f"🔄 Audit returned for revision:\n\n{audit_feedback[:300]}")
+                audit_trail.append({
+                    "phase": "auditor",
+                    "iteration": iteration,
+                    "status": "rejected",
+                    "content_preview": audit_feedback[:300],
+                })
+                # Prepare for next draft round by feeding feedback back to drafter
+
+        except Exception as exc:  # noqa: BLE001
+            logger.exception("Auditor call failed on iteration %d: %s", iteration, exc)
+            st.error(f"Audit interrupted: {exc}")
+            audit_trail.append({
+                "phase": "auditor",
+                "iteration": iteration,
+                "status": "error",
+                "content_preview": str(exc)[:300],
+            })
+            render_audit_trail_info()
+            # If auditor fails, we still have a draft — return it rather than crashing
+            return draft, audit_trail
+
+    render_audit_trail_info()
+    return draft, audit_trail
+
+
+
+# ---------------------------------------------------------------------------
+# Existing UI helpers (PRESERVED from 8_app.py)
+# ---------------------------------------------------------------------------
+
 def initialize_session_state() -> None:
     """初始化 Streamlit 会话状态。"""
     st.session_state.setdefault("chat_history", [])
@@ -659,7 +922,8 @@ def initialize_session_state() -> None:
     st.session_state.setdefault("last_active_tier", f"Tier 1 · {MODEL_NAME} (full)")
     st.session_state.setdefault("last_fallback_note", "")
     st.session_state.setdefault("last_attempt_failures", [])
-
+    st.session_state.setdefault("last_retrieval_path", FAST_PATH_LABEL)
+    st.session_state.setdefault("audit_trail_rendered", False)
 
 
 def clear_chat_state() -> None:
@@ -672,18 +936,27 @@ def clear_chat_state() -> None:
     st.session_state["last_active_tier"] = f"Tier 1 · {MODEL_NAME} (full)"
     st.session_state["last_fallback_note"] = ""
     st.session_state["last_attempt_failures"] = []
+    st.session_state["last_retrieval_path"] = FAST_PATH_LABEL
+    st.session_state["audit_trail_rendered"] = False
 
 
 
 def render_sidebar(collection_count: int) -> Tuple[str, int]:
     """渲染侧边栏配置区。"""
     st.sidebar.header("Control Panel")
+
+    # PART B — 3-mode selectbox (kept as radio for consistency with 8_app.py layout)
     mode = st.sidebar.radio(
         "Answer Mode",
-        options=[STRICT_MODE, BACKGROUND_MODE],
+        options=[STRICT_MODE, BACKGROUND_MODE, AUDIT_MODE],
         index=0,
-        help="Strict Grounding 默认只允许基于检索证据作答；Allow Background Knowledge 允许在证据不足时补充一般背景知识。",
+        help=(
+            "Strict Grounding: only retrieved evidence. "
+            "Allow Background Knowledge: evidence first, limited background allowed. "
+            "Audited Compliance Report: dual-agent draft + audit loop (non-streaming, 3 rounds max)."
+        ),
     )
+
     top_k = st.sidebar.slider("Top-k Retrieved Chunks", min_value=2, max_value=8, value=DEFAULT_TOP_K, step=1)
 
     st.sidebar.markdown("---")
@@ -693,6 +966,7 @@ def render_sidebar(collection_count: int) -> Tuple[str, int]:
     st.sidebar.write(f"Active Tier: `{st.session_state.get('last_active_tier', f'Tier 1 · {MODEL_NAME} (full)')}`")
     st.sidebar.write(f"Collection: `{COLLECTION_NAME}`")
     st.sidebar.write(f"Chunk Count: `{collection_count}`")
+    st.sidebar.write(f"Retrieval Path: `{st.session_state.get('last_retrieval_path', FAST_PATH_LABEL)}`")
     st.sidebar.write(f"SQLite: `{ACTIVE_SQLITE_VERSION}`")
     st.sidebar.write(f"Anthropic Endpoint: `{get_effective_anthropic_endpoint()}`")
 
@@ -726,17 +1000,24 @@ def render_sidebar(collection_count: int) -> Tuple[str, int]:
     return mode, top_k
 
 
-
 def render_chat_history() -> None:
     """渲染已有聊天历史。"""
     for item in st.session_state["chat_history"]:
         with st.chat_message(item["role"]):
             st.markdown(item["text"])
+
+            audit_trail = item.get("audit_trail") or []
+            if item.get("mode") == AUDIT_MODE and audit_trail:
+                st.info("📋 AUDIT TRAIL")
+                for step in audit_trail:
+                    icon = "✅" if step["status"] == "approved" else "🔄"
+                    st.write(f"{icon} **{step['phase']}** (Round {step['iteration']}) — {step['status'].upper()}")
+                    st.caption(step["content_preview"][:200])
+
             citations = item.get("citations") or []
             citations_markdown = render_citations_markdown(citations)
             if citations_markdown:
                 st.markdown(citations_markdown)
-
 
 
 def render_audit_panel() -> None:
@@ -746,7 +1027,9 @@ def render_audit_panel() -> None:
 
     evidence_records = st.session_state.get("last_evidence") or []
     last_mode = st.session_state.get("last_mode") or STRICT_MODE
+    last_retrieval_path = st.session_state.get("last_retrieval_path") or FAST_PATH_LABEL
     st.write(f"**Last Mode:** `{last_mode}`")
+    st.write(f"**Retrieval Path:** `{last_retrieval_path}`")
     st.write(f"**Evidence Chunks:** `{len(evidence_records)}`")
 
     if not evidence_records:
@@ -758,7 +1041,6 @@ def render_audit_panel() -> None:
         with st.expander(title, expanded=False):
             st.caption(f"Similarity Score: {record['score']:.4f}")
             st.write(record["text"])
-
 
 
 def render_empty_evidence_message(mode: str, user_query: str) -> Dict[str, Any]:
@@ -782,9 +1064,8 @@ def render_empty_evidence_message(mode: str, user_query: str) -> Dict[str, Any]:
     }
 
 
-
 def main() -> None:
-    """启动 Streamlit RegTech RAG 聊天应用。"""
+    """启动 Streamlit RegTech RAG 聊天应用（含第三种审计模式）。"""
     configure_logging()
     base_dir, db_dir = resolve_paths()
     load_environment(base_dir)
@@ -792,7 +1073,10 @@ def main() -> None:
 
     st.set_page_config(page_title=APP_TITLE, page_icon="📘", layout="wide")
     st.title("📘 RegTech RAG Assistant")
-    st.caption("A grounded Streamlit research workspace for regulatory Q&A with Claude, local ChromaDB, and page-level citations.")
+    st.caption(
+        "A grounded Streamlit research workspace for regulatory Q&A with Claude, local ChromaDB, "
+        "and page-level citations. Switch to *Audited Compliance Report* mode for a dual-agent draft + audit loop."
+    )
 
     initialize_session_state()
 
@@ -800,7 +1084,7 @@ def main() -> None:
         collection_count = get_collection_count(str(db_dir))
     except Exception as exc:  # noqa: BLE001
         st.error(
-            "ChromaDB is not ready. Please run `make build` first to create the local collection `regtech_pdf_docs`."
+            "ChromaDB is not ready. Please run `make build-llamaindex` first to create the local collection `regtech_parent_child_docs`."
         )
         st.exception(exc)
         return
@@ -808,7 +1092,11 @@ def main() -> None:
     try:
         _ = get_anthropic_client()
     except Exception as exc:  # noqa: BLE001
+        # Diagnostic: show what env vars look like
+        key_val = (os.getenv("ANTHROPIC_API_KEY") or "")
+        url_val = (os.getenv("ANTHROPIC_BASE_URL") or "")
         st.error("Anthropic client initialization failed. Please verify your `.env` configuration.")
+        st.caption(f"Diagnostic: key_len={len(key_val)} base_url='{url_val}'")
         st.exception(exc)
         return
 
@@ -835,7 +1123,7 @@ def main() -> None:
 
     try:
         with st.spinner("Retrieving supporting evidence from local ChromaDB..."):
-            evidence_records = retrieve_evidence(query=user_query, top_k=top_k, db_dir=db_dir)
+            evidence_records = retrieve_evidence_adaptive(query=user_query, top_k=top_k, db_dir=db_dir)
     except Exception as exc:  # noqa: BLE001
         with chat_column:
             with st.chat_message("assistant"):
@@ -844,7 +1132,77 @@ def main() -> None:
         return
 
     st.session_state["last_evidence"] = evidence_records
+    st.session_state["audit_trail_rendered"] = False
 
+    # ── PART E — Audit mode branch ─────────────────────────────────────────────
+    if mode == AUDIT_MODE:
+        with chat_column:
+            with st.chat_message("assistant"):
+                report_title_slot = st.empty()
+                report_body_slot = st.empty()
+                trail_slot = st.container()
+                citations_slot = st.container()
+
+            try:
+                final_draft, audit_trail = run_audited_compliance_report(
+                    query=user_query,
+                    evidence_records=evidence_records,
+                    chat_display=trail_slot,
+                )
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Audit flow failed with fallback to streaming: %s", exc)
+                st.error(f"Audit mode failed: {exc}. Falling back to standard streaming response.")
+                # Fall back to standard streaming flow
+                final_draft = ""
+                audit_trail = []
+
+            if final_draft:
+                report_title_slot.markdown("### Audited Compliance Report")
+                report_body_slot.markdown(final_draft)
+
+                if not st.session_state.get("audit_trail_rendered"):
+                    trail_slot.caption("_Audit trail was not rendered inside the audit loop._")
+
+                citations = select_citations(answer_text=final_draft, evidence_records=evidence_records)
+                citations_markdown = render_citations_markdown(citations)
+                if citations_markdown:
+                    citations_slot.markdown(citations_markdown)
+
+                st.session_state["chat_history"].append({
+                    "role": "assistant",
+                    "text": final_draft,
+                    "mode": AUDIT_MODE,
+                    "citations": citations if final_draft else [],
+                    "audit_trail": audit_trail,
+                })
+            else:
+                # If audit produced nothing, fall back to streaming response
+                st.info("Audit produced no content. Switching to standard streaming response.")
+                response_generator, stream_state = stream_claude_answer(
+                    history=st.session_state["chat_history"][:-1],
+                    user_query=user_query,
+                    mode=STRICT_MODE,
+                    evidence_records=evidence_records,
+                )
+                streamed_output = st.write_stream(response_generator)
+                answer_text = streamed_output if isinstance(streamed_output, str) else ""
+                if stream_state.get("error"):
+                    st.error(stream_state["error"])
+                    answer_text = answer_text or ""
+                citations = select_citations(answer_text=answer_text, evidence_records=evidence_records)
+                citations_markdown = render_citations_markdown(citations)
+                if citations_markdown:
+                    st.markdown(citations_markdown)
+                st.session_state["chat_history"].append({
+                    "role": "assistant",
+                    "text": answer_text,
+                    "citations": citations,
+                    "mode": STRICT_MODE,
+                })
+
+        st.rerun()
+
+    # ── Standard streaming flow (Strict / Background modes) ─────────────────
     if not evidence_records and mode == STRICT_MODE:
         assistant_message = render_empty_evidence_message(mode=mode, user_query=user_query)
         st.session_state["chat_history"].append(assistant_message)
