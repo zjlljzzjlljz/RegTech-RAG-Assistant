@@ -14,6 +14,8 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import math
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -24,6 +26,8 @@ from src.indexing import BGEM3EmbeddingClient, MilvusHybridStore
 from src.retrieval import ComplianceRetrievalPipeline, CrossEncoderRerankerClient, RetrievalRequest
 
 logger = logging.getLogger(__name__)
+_DEBUG_RAGAS = os.getenv("RAGAS_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
+_DEBUG_LIMIT = int(os.getenv("RAGAS_DEBUG_LIMIT", "0") or "0")
 
 try:
     from datasets import Dataset
@@ -83,8 +87,11 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
         def set_run_config(self, run_config: Any) -> None:
             self.run_config = run_config
 
-        def get_temperature(self) -> float:
+        def get_temperature(self, n: int = 1) -> float:
             return 0.0
+
+        def is_finished(self, response: LLMResult) -> bool:
+            return True
 
         def _request_text(
             self,
@@ -114,7 +121,17 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
                 request["stop_sequences"] = stop
 
             response = self._client.messages.create(**request)
-            return _response_text(getattr(response, "content", []))
+            text = _response_text(getattr(response, "content", []))
+            if _DEBUG_RAGAS:
+                logger.info(
+                    "RAGAS_DEBUG _request_text -> chars=%d empty=%s stop=%s",
+                    len(text),
+                    not bool(text.strip()),
+                    bool(stop),
+                )
+                if text:
+                    logger.info("RAGAS_DEBUG _request_text preview=%r", text[:240])
+            return text
 
         def generate_text(
             self,
@@ -123,10 +140,24 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
             temperature: float = 1e-8,
             stop: list[str] | None = None,
             callbacks: Any = None,
+            **kwargs: Any,
         ) -> LLMResult:
             text = self._request_text(prompt, temperature=temperature, stop=stop)
             generations = [Generation(text=text) for _ in range(max(1, n))]
-            return LLMResult(generations=[generations], llm_output={"model": self.model_name})
+            result = LLMResult(generations=[generations], llm_output={"model": self.model_name})
+            if _DEBUG_RAGAS:
+                outer = len(result.generations)
+                inner = len(result.generations[0]) if result.generations else 0
+                first = result.generations[0][0].text if result.generations and result.generations[0] else ""
+                logger.info(
+                    "RAGAS_DEBUG generate_text -> requested_n=%d outer=%d inner=%d first_chars=%d kwargs=%s",
+                    n,
+                    outer,
+                    inner,
+                    len(first),
+                    sorted(kwargs.keys()),
+                )
+            return result
 
         async def agenerate_text(
             self,
@@ -135,6 +166,7 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
             temperature: float = 1e-8,
             stop: list[str] | None = None,
             callbacks: Any = None,
+            **kwargs: Any,
         ) -> LLMResult:
             return await asyncio.to_thread(
                 self.generate_text,
@@ -143,6 +175,7 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
                 temperature,
                 stop,
                 callbacks,
+                **kwargs,
             )
 
 else:
@@ -160,7 +193,7 @@ else:
         def set_run_config(self, run_config: Any) -> None:
             self.run_config = run_config
 
-        def get_temperature(self) -> float:
+        def get_temperature(self, n: int = 1) -> float:
             return 0.0
 
         def _request_text(
@@ -200,6 +233,7 @@ else:
             temperature: float = 1e-8,
             stop: list[str] | None = None,
             callbacks: Any = None,
+            **kwargs: Any,
         ) -> Any:
             return {
                 "generations": [[{"text": self._request_text(prompt, temperature=temperature, stop=stop)}]],
@@ -213,6 +247,7 @@ else:
             temperature: float = 1e-8,
             stop: list[str] | None = None,
             callbacks: Any = None,
+            **kwargs: Any,
         ) -> Any:
             return await asyncio.to_thread(
                 self.generate_text,
@@ -221,6 +256,7 @@ else:
                 temperature,
                 stop,
                 callbacks,
+                **kwargs,
             )
 
 
@@ -360,6 +396,8 @@ def run_generation_eval(
     """Run the graph against annotated queries and collect evaluation records."""
     records: list[dict[str, Any]] = []
     annotated_queries = [q for q in test_queries if str(q.get("ground_truth_answer", "")).strip()]
+    if _DEBUG_LIMIT > 0:
+        annotated_queries = annotated_queries[:_DEBUG_LIMIT]
 
     for index, item in enumerate(annotated_queries, start=1):
         query = str(item.get("query", "")).strip()
@@ -380,19 +418,28 @@ def run_generation_eval(
             logger.warning("Agent evaluation failed for query '%s': %s", query[:60], exc)
             continue
 
-        records.append(
-            {
-                "question": query,
-                "answer": str(getattr(result, "answer", "") or ""),
-                "contexts": contexts,
-                "ground_truth": str(item.get("ground_truth_answer", "") or "").strip(),
-            }
-        )
+        record = {
+            "question": query,
+            "answer": str(getattr(result, "answer", "") or ""),
+            "contexts": contexts,
+            "ground_truth": str(item.get("ground_truth_answer", "") or "").strip(),
+        }
+        if _DEBUG_RAGAS:
+            logger.info(
+                "RAGAS_DEBUG record -> query_chars=%d answer_chars=%d contexts=%d ground_truth_chars=%d",
+                len(record["question"]),
+                len(record["answer"]),
+                len(record["contexts"]),
+                len(record["ground_truth"]),
+            )
+        records.append(record)
 
     return records
 
 
 def _format_bar(value: float, width: int = 24) -> str:
+    if not math.isfinite(value):
+        return "?" * width
     filled = max(0, min(width, int(round(value * width))))
     return "#" * filled + "." * (width - filled)
 
@@ -410,13 +457,29 @@ def print_report(scores: dict[str, float], evaluated_count: int) -> None:
         ("Context Recall", "context_recall"),
     ):
         score = float(scores.get(key, 0.0))
-        print(f"\n  {label:17} {score:.4f}  [{_format_bar(score)}]")
+        score_text = f"{score:.4f}" if math.isfinite(score) else "nan"
+        print(f"\n  {label:17} {score_text:>6}  [{_format_bar(score)}]")
 
     print("\n" + "=" * 72)
 
 
 def _extract_metric_score(result: Any, metric_name: str) -> float:
     scores = getattr(result, "scores", None)
+    if isinstance(scores, list):
+        values: list[float] = []
+        for row in scores:
+            if not isinstance(row, dict):
+                continue
+            value = row.get(metric_name)
+            if value is None:
+                continue
+            numeric = float(value)
+            if math.isfinite(numeric):
+                values.append(numeric)
+        if values:
+            return sum(values) / len(values)
+        return float("nan")
+
     if isinstance(scores, dict):
         value = scores.get(metric_name)
         if value is not None:
@@ -472,6 +535,18 @@ def _evaluate_ragas(
         llm=llm,
         embeddings=embeddings,
     )
+
+    if _DEBUG_RAGAS:
+        raw_scores = getattr(result, "scores", None)
+        logger.info("RAGAS_DEBUG evaluate result type=%s", type(result).__name__)
+        logger.info("RAGAS_DEBUG evaluate scores type=%s", type(raw_scores).__name__)
+        logger.info("RAGAS_DEBUG evaluate scores raw=%r", raw_scores)
+        for metric_name in ("faithfulness", "answer_relevancy", "context_recall"):
+            logger.info(
+                "RAGAS_DEBUG aggregated %s=%s",
+                metric_name,
+                _extract_metric_score(result, metric_name),
+            )
 
     return {
         "faithfulness": _extract_metric_score(result, "faithfulness"),
