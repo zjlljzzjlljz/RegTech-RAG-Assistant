@@ -9,3 +9,4 @@ chroma_db/
 comparison_results.json
 langgraph_install.log
 .claude_page_extracts.txt
+results/
