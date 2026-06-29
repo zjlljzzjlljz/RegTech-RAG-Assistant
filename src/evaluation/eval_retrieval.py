@@ -51,7 +51,10 @@ def search_single_query(
     Calls encode() → hybrid_search(), merges dense[:top_k] + sparse[:top_k],
     deduplicates by chunk_id while preserving order.
     """
-    embedding = embedding_client.encode(query)
+    embedding = embedding_client.encode(
+        query,
+        prompt="Represent this sentence for searching relevant passages: ",
+    )
     dense_hits, sparse_hits = store.hybrid_search(
         dense_vector=embedding.dense_vector,
         sparse_vector=embedding.sparse_vector,

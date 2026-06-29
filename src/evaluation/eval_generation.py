@@ -283,7 +283,10 @@ if BaseRagasEmbeddings is not None:
             return self._embed_many(texts)
 
         def embed_query(self, text: str) -> list[float]:
-            return self._embed_many([text])[0]
+            return self._embed_many(
+                [text],
+                prompt="Represent this sentence for searching relevant passages: ",
+            )[0]
 
         def embed_documents(self, texts: list[str]) -> list[list[float]]:
             return self._embed_many(texts)
@@ -317,7 +320,10 @@ else:
             return self._embed_many(texts)
 
         def embed_query(self, text: str) -> list[float]:
-            return self._embed_many([text])[0]
+            return self._embed_many(
+                [text],
+                prompt="Represent this sentence for searching relevant passages: ",
+            )[0]
 
         def embed_documents(self, texts: list[str]) -> list[list[float]]:
             return self._embed_many(texts)

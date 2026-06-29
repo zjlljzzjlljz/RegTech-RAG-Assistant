@@ -383,7 +383,10 @@ class ComplianceRetrievalPipeline:
         return await asyncio.gather(*tasks)
 
     def _search_single_query(self, query: str, filters: str | None) -> list[RetrievedChunk]:
-        embedding = self.embedding_client.encode(query)
+        embedding = self.embedding_client.encode(
+            query,
+            prompt="Represent this sentence for searching relevant passages: ",
+        )
         dense_hits, sparse_hits = self.store.hybrid_search(
             dense_vector=embedding.dense_vector,
             sparse_vector=embedding.sparse_vector,

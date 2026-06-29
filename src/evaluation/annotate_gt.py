@@ -53,7 +53,10 @@ def search_chunks(
     top_k: int = 10,
 ) -> list[dict[str, Any]]:
     """Direct hybrid search returning top-K chunk dicts with deduplication."""
-    embedding = embedding_client.encode(query)
+    embedding = embedding_client.encode(
+        query,
+        prompt="Represent this sentence for searching relevant passages: ",
+    )
     dense_hits, sparse_hits = store.hybrid_search(
         dense_vector=embedding.dense_vector,
         sparse_vector=embedding.sparse_vector,

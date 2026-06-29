@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
@@ -196,6 +197,26 @@ class ComplianceAgentGraph:
         }
 
     @staticmethod
+    def _parse_json_response(text: str) -> dict[str, Any] | None:
+        cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).replace("```", "").strip()
+        for candidate in (text, cleaned):
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
+        if match:
+            try:
+                parsed = json.loads(match.group(0))
+                if isinstance(parsed, dict):
+                    return parsed
+            except json.JSONDecodeError:
+                pass
+        return None
+
+    @staticmethod
     def _extract_text(content: list[Any]) -> str:
         parts: list[str] = []
         for block in content:
@@ -352,10 +373,8 @@ class ComplianceAgentGraph:
             }
 
             # Parse JSON response
-            parsed: dict[str, Any] = {}
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
+            parsed = self._parse_json_response(body)
+            if parsed is None:
                 logger.warning("generate_draft_node → non-JSON response, treating as raw markdown")
                 parsed = {"answer_summary": body, "claims": []}
 
@@ -457,9 +476,8 @@ class ComplianceAgentGraph:
                 elapsed_ms,
             )
 
-            try:
-                parsed = json.loads(body)
-            except json.JSONDecodeError:
+            parsed = self._parse_json_response(body)
+            if parsed is None:
                 logger.warning("auditor_review_node → non-JSON, defaulting to approval")
                 parsed = {"approved": True, "feedback": ""}
 
