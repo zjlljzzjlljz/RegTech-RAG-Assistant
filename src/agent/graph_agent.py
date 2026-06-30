@@ -47,6 +47,7 @@ class AuditResult:
     cite_sources: list[str]
     token_metrics: dict[str, int]
     error: Optional[str]
+    retrieved_chunks: list[RetrievedChunk] | None = None
     iterations: int = 0
 
 
@@ -446,6 +447,17 @@ class ComplianceAgentGraph:
             for i, chunk in enumerate(chunks, 1):
                 chunk_id_map[f"chunk-{i}"] = chunk
 
+            # Build full evidence context for auditor (matching generate_draft_node format)
+            evidence_parts: list[str] = []
+            for short_id, chunk in chunk_id_map.items():
+                loc = (
+                    f"{chunk.source_file}#page-{chunk.page_number}"
+                    if getattr(chunk, "page_number", None)
+                    else str(chunk.source_file)
+                )
+                evidence_parts.append(f"[ID: {short_id}] [{loc}]\n{chunk.text}")
+            evidence_context = "\n\n".join(evidence_parts)
+
             system_text = (
                 "You are a senior compliance auditor. Your job is to review a Draftee's compliance answer "
                 "for three critical issues:\n"
@@ -465,7 +477,7 @@ class ComplianceAgentGraph:
             prompt = (
                 f"## User Question\n{query}\n\n"
                 f"## Draftee Answer\n{draft}\n\n"
-                f"## Evidence Chunk IDs Available\n{list(chunk_id_map.keys())}"
+                f"## Evidence Context\n{evidence_context}"
             )
 
             response = self._claude_request(prompt, system_text)
@@ -682,6 +694,7 @@ class ComplianceAgentGraph:
         token_metrics = dict(final_state.get("token_metrics") or {})
         error = str(final_state.get("error_message") or "") or None
         iterations = int(final_state.get("current_iteration", 0) or 0)
+        retrieved_chunks = list(final_state.get("retrieved_chunks") or []) or None
 
         return AuditResult(
             answer=answer,
@@ -689,6 +702,7 @@ class ComplianceAgentGraph:
             cite_sources=cite_sources,
             token_metrics=token_metrics,
             error=error,
+            retrieved_chunks=retrieved_chunks,
             iterations=iterations,
         )
 

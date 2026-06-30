@@ -16,6 +16,7 @@ import json
 import logging
 import math
 import os
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -23,7 +24,7 @@ from typing import Any
 from config.settings import configure_logging, get_anthropic_client, get_settings
 from src.agent import ComplianceAgentGraph
 from src.indexing import BGEM3EmbeddingClient, MilvusHybridStore
-from src.retrieval import ComplianceRetrievalPipeline, CrossEncoderRerankerClient, RetrievalRequest
+from src.retrieval import ComplianceRetrievalPipeline, CrossEncoderRerankerClient
 
 logger = logging.getLogger(__name__)
 _DEBUG_RAGAS = os.getenv("RAGAS_DEBUG", "").strip().lower() in {"1", "true", "yes", "on"}
@@ -380,24 +381,18 @@ def build_agent_stack(
     return agent_graph, pipeline, embedding_client
 
 
-def _extract_contexts(retrieval_result: Any) -> list[str]:
+def _extract_contexts_from_chunks(chunks: list[Any] | None) -> list[str]:
     contexts: list[str] = []
-    for chunk in list(getattr(retrieval_result, "reranked_chunks", []) or []):
+    for chunk in list(chunks or []):
         text = str(getattr(chunk, "text", "")).strip()
         if text:
             contexts.append(text)
     return contexts
 
 
-def _retrieve_contexts(pipeline: ComplianceRetrievalPipeline, query: str) -> list[str]:
-    retrieval_result = _run_coroutine(pipeline.retrieve(RetrievalRequest(user_query=query)))
-    return _extract_contexts(retrieval_result)
-
-
 def run_generation_eval(
     test_queries: list[dict[str, Any]],
     agent_graph: ComplianceAgentGraph,
-    pipeline: ComplianceRetrievalPipeline,
 ) -> list[dict[str, Any]]:
     """Run the graph against annotated queries and collect evaluation records."""
     records: list[dict[str, Any]] = []
@@ -410,23 +405,25 @@ def run_generation_eval(
         if not query:
             continue
 
+        sample_start = time.perf_counter()
         logger.info("[%d/%d] Evaluating generation: %s", index, len(annotated_queries), query[:80])
 
+        retrieval_ms = 0.0
         try:
-            contexts = _retrieve_contexts(pipeline, query)
-        except Exception as exc:  # noqa: BLE001
-            logger.warning("Retrieval failed for query '%s': %s", query[:60], exc)
-            contexts = []
-
-        try:
+            retrieval_start = time.perf_counter()
             result = agent_graph.invoke({"user_query": query})
+            retrieval_ms = (time.perf_counter() - retrieval_start) * 1000
         except Exception as exc:  # noqa: BLE001
             logger.warning("Agent evaluation failed for query '%s': %s", query[:60], exc)
             continue
 
+        contexts = _extract_contexts_from_chunks(getattr(result, "retrieved_chunks", None))
+        graph_ms = retrieval_ms
+        answer = str(getattr(result, "answer", "") or "")
+
         record = {
             "question": query,
-            "answer": str(getattr(result, "answer", "") or ""),
+            "answer": answer,
             "contexts": contexts,
             "ground_truth": str(item.get("ground_truth_answer", "") or "").strip(),
         }
@@ -438,6 +435,16 @@ def run_generation_eval(
                 len(record["contexts"]),
                 len(record["ground_truth"]),
             )
+
+        elapsed_ms = (time.perf_counter() - sample_start) * 1000
+        logger.info(
+            "[%d/%d] sample done in %.1f ms (graph=%.1f ms, contexts=%d)",
+            index,
+            len(annotated_queries),
+            elapsed_ms,
+            graph_ms,
+            len(contexts),
+        )
         records.append(record)
 
     return records
@@ -593,7 +600,7 @@ def main() -> None:
     test_queries = load_test_queries(queries_path)
     agent_graph, pipeline, embedding_client = build_agent_stack(settings)
 
-    records = run_generation_eval(test_queries, agent_graph, pipeline)
+    records = run_generation_eval(test_queries, agent_graph)
     if not records:
         logger.error("No annotated queries were available for generation evaluation")
         raise SystemExit(1)
