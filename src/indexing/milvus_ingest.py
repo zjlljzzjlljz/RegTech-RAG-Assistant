@@ -12,6 +12,7 @@ import numpy as np
 from pymilvus import AnnSearchRequest, Collection, CollectionSchema, DataType, FieldSchema, MilvusClient, connections, utility
 
 from config.settings import Settings, get_settings
+from src.indexing.sparse_tokenizer import tokenize_and_weight
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,8 @@ class BGEM3EmbeddingClient:
                 raise ValueError("No sparse key in result")
 
             # scipy sparse matrix: convert to {idx: weight} dict
-            from scipy.sparse import issparse, csr_matrix
+            from scipy.sparse import issparse
+
             if issparse(sparse):
                 coo = sparse.tocoo()
                 return {int(idx): float(val) for idx, val in zip(coo.col, coo.data)}
@@ -92,24 +94,23 @@ class BGEM3EmbeddingClient:
                 values = sparse.get("values") or []
                 if indices and values:
                     return {int(idx): float(val) for idx, val in zip(indices, values)}
-                # Plain token weights: {token: weight}
-                return {int(abs(hash(str(k)))) % 500_000: float(v) for k, v in sparse.items()}
         except Exception:
             pass
-        # Fallback: simplified hash-based sparse
+        # Fallback: use shared deterministic tokenizer
         return self._build_sparse_vector_fallback("")
 
     def _build_sparse_vector(self, text: str) -> dict[int, float]:
-        """Simplified hash-based sparse vector fallback."""
-        return self._build_sparse_vector_fallback(text)
+        """Build sparse vector for *text* using the shared deterministic tokenizer."""
+        return tokenize_and_weight(text)
 
     def _build_sparse_vector_fallback(self, text: str) -> dict[int, float]:
-        """Hash-based token weighting as fallback sparse representation."""
-        token_weights: dict[int, float] = defaultdict(float)
-        for token in text.lower().split():
-            token_id = abs(hash(token)) % 500_000
-            token_weights[token_id] += 1.0
-        return dict(token_weights)
+        """Build sparse vector using the shared deterministic tokenizer.
+
+        This is the single source of truth for all sparse vectors at both
+        ingest time and query time.  Uses blake2b (not Python hash()) so
+        results are identical across Python processes.
+        """
+        return tokenize_and_weight(text)
 
 
 class MilvusHybridStore:
@@ -244,6 +245,50 @@ class MilvusHybridStore:
             output_fields=output_fields,
         )[0]
         return self._normalize_hits(dense_hits), self._normalize_hits(sparse_hits)
+
+    def sparse_only_search(
+        self,
+        sparse_vector: dict[int, float],
+        top_k: int,
+        output_fields: list[str],
+        filters: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pure sparse-vector search — dense vector is bypassed.
+
+        Used by eval_retrieval.py --sparse-only for diagnostic purposes only.
+        """
+        self.collection.load()
+        sparse_hits = self.collection.search(
+            data=[sparse_vector],
+            anns_field="sparse_vector",
+            param={"metric_type": self.settings.milvus.sparse_metric_type, "params": {"drop_ratio_search": 0.0}},
+            limit=top_k,
+            expr=filters,
+            output_fields=output_fields,
+        )[0]
+        return self._normalize_hits(sparse_hits)
+
+    def dense_only_search(
+        self,
+        dense_vector: list[float],
+        top_k: int,
+        output_fields: list[str],
+        filters: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Pure dense-vector search — sparse vector is bypassed.
+
+        Used by eval_retrieval.py --fusion dense-only for diagnostic purposes.
+        """
+        self.collection.load()
+        dense_hits = self.collection.search(
+            data=[dense_vector],
+            anns_field="dense_vector",
+            param={"metric_type": self.settings.milvus.dense_metric_type, "params": {"ef": self.settings.milvus.search_probe}},
+            limit=top_k,
+            expr=filters,
+            output_fields=output_fields,
+        )[0]
+        return self._normalize_hits(dense_hits)
 
     def _normalize_hits(self, hits: list[Any]) -> list[dict[str, Any]]:
         normalized: list[dict[str, Any]] = []

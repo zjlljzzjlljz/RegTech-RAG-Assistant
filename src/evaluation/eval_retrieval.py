@@ -3,6 +3,11 @@
 
 Usage:
     python -m src.evaluation.eval_retrieval
+    python -m src.evaluation.eval_retrieval --fusion rrf
+    python -m src.evaluation.eval_retrieval --fusion dedup
+    python -m src.evaluation.eval_retrieval --fusion rrf --with-rerank
+    python -m src.evaluation.eval_retrieval --fusion sparse-only
+    python -m src.evaluation.eval_retrieval --fusion dense-only
 
 Performs direct hybrid search (bypassing async/LLM pipeline),
 and reports Hit@1, Hit@3, Hit@5, and MRR.
@@ -10,8 +15,10 @@ and reports Hit@1, Hit@3, Hit@5, and MRR.
 
 from __future__ import annotations
 
+import argparse
 import json
 import logging
+from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +39,38 @@ _OUTPUT_FIELDS = [
 ]
 
 
+def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Run retrieval-only evaluation over labeled queries.")
+    parser.add_argument(
+        "--queries-file",
+        default=str(Path(__file__).resolve().parent / "test_queries.json"),
+        help="Path to a JSON file with query, text, and ground_truth_chunk_ids entries.",
+    )
+    parser.add_argument(
+        "--fusion",
+        default="rrf",
+        choices=["rrf", "dedup", "sparse-only", "dense-only"],
+        help=(
+            "Fusion strategy for combining dense and sparse retrieval arms:\n"
+            "  rrf        — Reciprocal Rank Fusion (score-based, recommended)\n"
+            "  dedup      — dense-first then sparse dedup append (original broken behaviour)\n"
+            "  sparse-only — pure sparse retrieval only\n"
+            "  dense-only  — pure dense retrieval only"
+        ),
+    )
+    parser.add_argument(
+        "--with-rerank",
+        action="store_true",
+        help="Apply BAAI/bge-reranker-large cross-encoder reranking after fusion.",
+    )
+    parser.add_argument(
+        "--no-rerank",
+        action="store_true",
+        help="Explicitly disable reranking (RRF-only diagnostic mode).",
+    )
+    return parser.parse_args(argv)
+
+
 def load_test_queries(filepath: Path) -> list[dict[str, Any]]:
     """Load test queries from JSON file."""
     with open(filepath, encoding="utf-8") as fh:
@@ -40,40 +79,156 @@ def load_test_queries(filepath: Path) -> list[dict[str, Any]]:
     return queries
 
 
+def _reciprocal_rank_fusion(
+    dense_hits: list[dict[str, Any]],
+    sparse_hits: list[dict[str, Any]],
+    rrf_k: int,
+    rrf_top_k: int,
+) -> list[dict[str, Any]]:
+    """RRF fusion — identical to ComplianceRetrievalPipeline._reciprocal_rank_fusion."""
+    scored: dict[str, float] = {}
+    canonical: dict[str, dict[str, Any]] = {}
+    for rank, hit in enumerate(dense_hits, start=1):
+        cid = str(hit["chunk_id"])
+        scored[cid] = scored.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+        canonical.setdefault(cid, hit)
+    for rank, hit in enumerate(sparse_hits, start=1):
+        cid = str(hit["chunk_id"])
+        scored[cid] = scored.get(cid, 0.0) + 1.0 / (rrf_k + rank)
+        canonical.setdefault(cid, hit)
+    merged = sorted(scored.items(), key=lambda x: x[1], reverse=True)
+    return [canonical[cid] for cid, _ in merged[:rrf_top_k]]
+
+
 def search_single_query(
     query: str,
     embedding_client: BGEM3EmbeddingClient,
     store: MilvusHybridStore,
-    top_k: int = 10,
+    settings: Any,
+    fusion: str = "rrf",
+    with_rerank: bool = False,
+    reranker: Any | None = None,
 ) -> list[str]:
-    """Direct hybrid search — returns deduplicated chunk_id list (up to top_k).
+    """Direct hybrid search — returns chunk_id list.
 
-    Calls encode() → hybrid_search(), merges dense[:top_k] + sparse[:top_k],
-    deduplicates by chunk_id while preserving order.
+    fusion modes:
+        rrf         — RRF fusion of dense[:dense_top_k] and sparse[:sparse_top_k]
+        dedup       — dense[:top_k] then sparse[:top_k] with dedup (original broken behaviour)
+        sparse-only — pure sparse retrieval only
+        dense-only  — pure dense retrieval only
+
+    when with_rerank=True, RRF/dedup/dense-only results are reranked via
+    BAAI/bge-reranker-large cross-encoder before returning.
     """
     embedding = embedding_client.encode(
         query,
         prompt="Represent this sentence for searching relevant passages: ",
     )
-    dense_hits, sparse_hits = store.hybrid_search(
-        dense_vector=embedding.dense_vector,
-        sparse_vector=embedding.sparse_vector,
-        top_k=top_k,
-        output_fields=_OUTPUT_FIELDS,
-        filters=None,
-    )
+    rrf_k = settings.retrieval.rrf_k
+    rrf_top_k = settings.retrieval.rrf_top_k
+    rerank_top_k = settings.retrieval.rerank_top_k
+    rerank_threshold = settings.retrieval.rerank_score_threshold
+    dense_top_k = settings.retrieval.dense_top_k
+    sparse_top_k = settings.retrieval.sparse_top_k
 
-    seen: set[str] = set()
+    # ------------------------------------------------------------------
+    # Retrieval arm selection
+    # ------------------------------------------------------------------
+    if fusion == "sparse-only":
+        sparse_hits = store.sparse_only_search(
+            sparse_vector=embedding.sparse_vector,
+            top_k=rerank_top_k if with_rerank else rrf_top_k,
+            output_fields=_OUTPUT_FIELDS,
+            filters=None,
+        )
+        hits: list[dict[str, Any]] = sparse_hits
+
+    elif fusion == "dense-only":
+        dense_hits = store.dense_only_search(
+            dense_vector=embedding.dense_vector,
+            top_k=rerank_top_k if with_rerank else rrf_top_k,
+            output_fields=_OUTPUT_FIELDS,
+            filters=None,
+        )
+        hits = dense_hits
+
+    else:
+        # hybrid: dense + sparse then fuse
+        dense_hits, sparse_hits = store.hybrid_search(
+            dense_vector=embedding.dense_vector,
+            sparse_vector=embedding.sparse_vector,
+            top_k=max(dense_top_k, sparse_top_k),
+            output_fields=_OUTPUT_FIELDS,
+            filters=None,
+        )
+        dense_trunc = dense_hits[:dense_top_k]
+        sparse_trunc = sparse_hits[:sparse_top_k]
+
+        if fusion == "dedup":
+            # Original broken behaviour: dense-first then sparse append, dedup
+            seen: set[str] = set()
+            merged: list[dict[str, Any]] = []
+            for hit in dense_trunc:
+                cid = str(hit.get("chunk_id", ""))
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    merged.append(hit)
+            for hit in sparse_trunc:
+                cid = str(hit.get("chunk_id", ""))
+                if cid and cid not in seen:
+                    seen.add(cid)
+                    merged.append(hit)
+            hits = merged
+
+        else:  # fusion == "rrf"
+            hits = _reciprocal_rank_fusion(dense_trunc, sparse_trunc, rrf_k, rrf_top_k)
+
+    # ------------------------------------------------------------------
+    # Reranking (applies to all fusion modes except sparse-only when reranking)
+    # ------------------------------------------------------------------
+    if with_rerank:
+        # Build RetrievedChunk list from hits
+        from dataclasses import dataclass
+
+        @dataclass
+        class RetrievedChunk:
+            chunk_id: str
+            parent_id: Any
+            text: str
+            source_file: str
+            page_number: Any
+            chunk_type: str
+            score: float
+            metadata: dict
+
+        chunks = [
+            RetrievedChunk(
+                chunk_id=str(hit["chunk_id"]),
+                parent_id=hit.get("parent_id"),
+                text=str(hit.get("text", "")),
+                source_file=str(hit.get("source_file", "")),
+                page_number=hit.get("page_number"),
+                chunk_type=str(hit.get("chunk_type", "")),
+                score=float(hit.get("score", 0.0)),
+                metadata=dict(hit.get("metadata", {})),
+            )
+            for hit in hits
+        ]
+        active_reranker = reranker
+        if active_reranker is None:
+            from src.retrieval.query_pipeline import CrossEncoderRerankerClient
+
+            active_reranker = CrossEncoderRerankerClient(settings.inference.reranker_model_name)
+        reranked = active_reranker.rerank(query, chunks, rerank_top_k, rerank_threshold)
+        return [c.chunk_id for c in reranked]
+
+    # ------------------------------------------------------------------
+    # No rerank — return raw hits as chunk_id list
+    # ------------------------------------------------------------------
     chunk_ids: list[str] = []
-    for hit in dense_hits[:top_k]:
+    for hit in hits:
         cid = str(hit.get("chunk_id", ""))
-        if cid and cid not in seen:
-            seen.add(cid)
-            chunk_ids.append(cid)
-    for hit in sparse_hits[:top_k]:
-        cid = str(hit.get("chunk_id", ""))
-        if cid and cid not in seen:
-            seen.add(cid)
+        if cid:
             chunk_ids.append(cid)
     return chunk_ids
 
@@ -82,14 +237,31 @@ def evaluate(
     test_queries: list[dict[str, Any]],
     embedding_client: BGEM3EmbeddingClient,
     store: MilvusHybridStore,
+    settings: Any,
+    fusion: str = "rrf",
+    with_rerank: bool = False,
 ) -> list[dict[str, Any]]:
     """Run all test queries through direct hybrid search."""
+    reranker = None
+    if with_rerank:
+        from src.retrieval.query_pipeline import CrossEncoderRerankerClient
+
+        reranker = CrossEncoderRerankerClient(settings.inference.reranker_model_name)
+
     results: list[dict[str, Any]] = []
     for i, tq in enumerate(test_queries):
         query = tq.get("query", "")
         logger.info("[%d/%d] Evaluating: %s", i + 1, len(test_queries), query[:80])
         try:
-            retrieved_ids = search_single_query(query, embedding_client, store)
+            retrieved_ids = search_single_query(
+                query,
+                embedding_client,
+                store,
+                settings,
+                fusion=fusion,
+                with_rerank=with_rerank,
+                reranker=reranker,
+            )
         except Exception as exc:  # noqa: BLE001
             logger.error("Search failed for query '%s': %s", query[:60], exc)
             retrieved_ids = []
@@ -105,10 +277,11 @@ def evaluate(
     return results
 
 
-def print_report(results: list[dict[str, Any]]) -> None:
+def print_report(results: list[dict[str, Any]], fusion: str, with_rerank: bool) -> None:
     """Print evaluation report to stdout."""
+    mode_tag = f"[{fusion.upper()}" + (", RERANKED]" if with_rerank else "]")
     print("\n" + "=" * 60)
-    print("  Compliance Retrieval Evaluation Report")
+    print(f"  Compliance Retrieval Evaluation Report {mode_tag}")
     print("=" * 60)
     print(f"  Total queries evaluated: {len(results)}")
 
@@ -145,7 +318,8 @@ def print_report(results: list[dict[str, Any]]) -> None:
 
     print("\n" + "=" * 60)
     logger.info(
-        "Eval complete — Hit@1=%.4f Hit@3=%.4f Hit@5=%.4f MRR=%.4f",
+        "Eval complete [%s] — Hit@1=%.4f Hit@3=%.4f Hit@5=%.4f MRR=%.4f",
+        mode_tag,
         hit1,
         hit3,
         hit5,
@@ -153,11 +327,12 @@ def print_report(results: list[dict[str, Any]]) -> None:
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
+    args = parse_args(argv)
     settings = get_settings()
     configure_logging(settings.app.log_level)
 
-    queries_path = Path(__file__).resolve().parent / "test_queries.json"
+    queries_path = Path(args.queries_file)
     if not queries_path.exists():
         logger.error("Test queries file not found: %s", queries_path)
         raise SystemExit(1)
@@ -167,8 +342,18 @@ def main() -> None:
     store = MilvusHybridStore(settings)
     embedding_client = BGEM3EmbeddingClient(settings.inference.embedding_model_name)
 
-    results = evaluate(test_queries, embedding_client, store)
-    print_report(results)
+    # --no-rerank overrides --with-rerank
+    with_rerank = bool(args.with_rerank) and not bool(args.no_rerank)
+
+    results = evaluate(
+        test_queries,
+        embedding_client,
+        store,
+        settings,
+        fusion=args.fusion,
+        with_rerank=with_rerank,
+    )
+    print_report(results, fusion=args.fusion, with_rerank=with_rerank)
 
 
 if __name__ == "__main__":
