@@ -1,5 +1,6 @@
 from .query_pipeline import (
     AnthropicLLMProvider,
+    ConfigurableLLMProvider,
     AuditIntent,
     AuditDecision,
     ComplianceRetrievalPipeline,
@@ -11,6 +12,7 @@ from .query_pipeline import (
 
 __all__ = [
     "AnthropicLLMProvider",
+    "ConfigurableLLMProvider",
     "AuditDecision",
     "AuditIntent",
     "ComplianceRetrievalPipeline",

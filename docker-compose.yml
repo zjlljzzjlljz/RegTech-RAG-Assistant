@@ -1,7 +1,39 @@
 services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: regtech-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: regtech
+      POSTGRES_USER: regtech
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-regtech-local}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U regtech -d regtech"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+    networks:
+      - regtech-net
+
+  migrate:
+    build:
+      context: .
+      dockerfile: services/migration/Dockerfile
+    environment:
+      DATABASE_URL: postgresql+psycopg://regtech:${POSTGRES_PASSWORD:-regtech-local}@postgres:5432/regtech
+    depends_on:
+      postgres:
+        condition: service_healthy
+    profiles: ["tools"]
+    networks:
+      - regtech-net
+
   etcd:
     container_name: regtech-etcd
     image: quay.io/coreos/etcd:v3.5.18
+    restart: unless-stopped
     environment:
       ETCD_AUTO_COMPACTION_MODE: revision
       ETCD_AUTO_COMPACTION_RETENTION: "1000"
@@ -25,6 +57,7 @@ services:
   minio:
     container_name: regtech-minio
     image: minio/minio:RELEASE.2025-02-28T09-55-16Z
+    restart: unless-stopped
     environment:
       MINIO_ACCESS_KEY: minioadmin
       MINIO_SECRET_KEY: minioadmin
@@ -45,6 +78,7 @@ services:
   milvus:
     container_name: regtech-milvus
     image: milvusdb/milvus:v2.5.11
+    restart: unless-stopped
     command: ["milvus", "run", "standalone"]
     environment:
       ETCD_ENDPOINTS: etcd:2379
@@ -57,7 +91,7 @@ services:
       - "9091:9091"
     depends_on:
       etcd:
-        condition: service_started
+        condition: service_healthy
       minio:
         condition: service_healthy
     healthcheck:
@@ -72,6 +106,7 @@ services:
   attu:
     container_name: regtech-attu
     image: zilliz/attu:v2.5.12
+    restart: unless-stopped
     environment:
       MILVUS_URL: milvus:19530
     ports:
@@ -88,16 +123,28 @@ services:
     working_dir: /app
     command: >-
       bash -lc "pip install --no-cache-dir -r requirements.txt &&
+      alembic upgrade head &&
       streamlit run app.py --server.address 0.0.0.0 --server.port 8501"
     environment:
       MILVUS_HOST: milvus
       MILVUS_PORT: "19530"
       STREAMLIT_PORT: "8501"
+      DATABASE_URL: postgresql+psycopg://regtech:${POSTGRES_PASSWORD:-regtech-local}@postgres:5432/regtech
+      LLM_PROVIDER: vllm
+      PLANNER_LLM_BASE_URL: http://planner-llm:8000/v1
+      DRAFT_LLM_BASE_URL: http://generation-llm:8000/v1
+      AUDITOR_LLM_BASE_URL: http://generation-llm:8000/v1
+      JUDGE_LLM_BASE_URL: http://generation-llm:8000/v1
+      EMBEDDING_SERVICE_URL: http://embedding:8000
+      RERANKER_SERVICE_URL: http://reranker:8000
+      NLI_SERVICE_URL: http://nli:8000
     ports:
       - "8501:8501"
     volumes:
       - ./:/app
     depends_on:
+      postgres:
+        condition: service_healthy
       milvus:
         condition: service_started
     profiles:
@@ -105,7 +152,159 @@ services:
     networks:
       - regtech-net
 
+  planner-llm:
+    image: vllm/vllm-openai:v0.8.5
+    command: >-
+      --model Qwen/Qwen2.5-7B-Instruct
+      --served-model-name Qwen/Qwen2.5-7B-Instruct
+      --enable-prefix-caching
+      --max-model-len 8192
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - regtech-net
+
+  generation-llm:
+    image: vllm/vllm-openai:v0.8.5
+    command: >-
+      --model Qwen/Qwen2.5-72B-Instruct-AWQ
+      --served-model-name Qwen/Qwen2.5-72B-Instruct-AWQ
+      --quantization awq
+      --tensor-parallel-size 2
+      --enable-prefix-caching
+      --max-model-len 16384
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 2
+              capabilities: [gpu]
+    networks:
+      - regtech-net
+
+  embedding:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile
+    environment:
+      SERVICE_MODE: embedding
+      MODEL_NAME: BAAI/bge-m3
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - regtech-net
+
+  embedding-cpu:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile.cpu
+    restart: unless-stopped
+    environment:
+      SERVICE_MODE: embedding
+      MODEL_NAME: BAAI/bge-m3
+      USE_FP16: "false"
+      DEVICE: "-1"
+    ports:
+      - "8101:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["cpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    networks:
+      - regtech-net
+
+  reranker-cpu:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile.cpu
+    restart: unless-stopped
+    environment:
+      SERVICE_MODE: reranker
+      MODEL_NAME: BAAI/bge-reranker-large
+      USE_FP16: "false"
+      DEVICE: "-1"
+    ports:
+      - "8102:8000"
+    volumes:
+      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
+    profiles: ["cpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    networks:
+      - regtech-net
+
+  reranker:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile
+    environment:
+      SERVICE_MODE: reranker
+      MODEL_NAME: BAAI/bge-reranker-large
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - regtech-net
+
+  nli:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile
+    environment:
+      SERVICE_MODE: nli
+      MODEL_NAME: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    networks:
+      - regtech-net
+
 volumes:
+  postgres-data:
+  hf-cache:
   etcd-data:
   minio-data:
   milvus-data:

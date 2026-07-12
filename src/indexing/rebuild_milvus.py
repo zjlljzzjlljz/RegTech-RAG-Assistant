@@ -84,7 +84,7 @@ def main(argv: list[str] | None = None) -> None:
     for pdf_path in pdfs:
         if args.dry_run:
             pages = indexer.parse_pdf(pdf_path)
-            chunks = indexer.build_parent_child_chunks(pages)
+            chunks = indexer.build_parent_child_chunks(pages, document_id=pdf_path.name)
             logger.info("[DRY-RUN] %s: %d pages → %d chunks", pdf_path.name, len(pages), len(chunks))
             total_chunks += len(chunks)
         else:

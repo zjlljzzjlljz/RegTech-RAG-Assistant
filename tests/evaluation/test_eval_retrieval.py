@@ -13,7 +13,7 @@ import src.evaluation.eval_retrieval as eval_retrieval
 def test_parse_args_defaults_to_builtin_test_queries_file() -> None:
     args = eval_retrieval.parse_args([])
 
-    assert Path(args.queries_file) == Path(eval_retrieval.__file__).resolve().parent / "test_queries.json"
+    assert Path(args.queries_file) == Path(eval_retrieval.__file__).resolve().parent / "test_queries_v2.json"
 
 
 def test_parse_args_fusion_default_is_rrf() -> None:
@@ -22,7 +22,7 @@ def test_parse_args_fusion_default_is_rrf() -> None:
 
 
 def test_parse_args_fusion_choices() -> None:
-    for mode in ["rrf", "dedup", "sparse-only", "dense-only"]:
+    for mode in ["all", "weighted-sweep", "rrf", "dedup", "sparse-only", "dense-only"]:
         args = eval_retrieval.parse_args(["--fusion", mode])
         assert args.fusion == mode
 
@@ -186,3 +186,52 @@ def test_evaluate_constructs_reranker_once_and_reuses_it(monkeypatch) -> None:
     assert len(seen_rerankers) == 2
     assert seen_rerankers[0] is not None
     assert seen_rerankers[0] is seen_rerankers[1]
+
+
+def test_evaluate_ablation_encodes_once_and_builds_all_modes() -> None:
+    class FakeEmbeddingClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def encode(self, query, prompt):
+            self.calls += 1
+            return SimpleNamespace(dense_vector=[0.1], sparse_vector={1: 0.2})
+
+    class FakeStore:
+        def hybrid_search(self, **kwargs):
+            return (
+                [{"chunk_id": "dense"}, {"chunk_id": "shared"}],
+                [{"chunk_id": "sparse"}, {"chunk_id": "shared"}],
+            )
+
+    settings = SimpleNamespace(
+        retrieval=SimpleNamespace(dense_top_k=2, sparse_top_k=2, rrf_top_k=2, rrf_k=60)
+    )
+    embedding_client = FakeEmbeddingClient()
+
+    results = eval_retrieval.evaluate_ablation(
+        [{"query": "q", "ground_truth_chunk_ids": ["shared"]}],
+        embedding_client,
+        FakeStore(),
+        settings,
+    )
+
+    assert embedding_client.calls == 1
+    assert set(results) == {"dense_only", "sparse_only", "dedup", "rrf"}
+    assert results["dense_only"][0]["retrieved_chunk_ids"] == ["dense", "shared"]
+    assert results["sparse_only"][0]["retrieved_chunk_ids"] == ["sparse", "shared"]
+    assert results["rrf"][0]["retrieved_chunk_ids"][0] == "shared"
+
+
+def test_weighted_rrf_prefers_dense_when_dense_weight_is_higher() -> None:
+    dense = [{"chunk_id": "other-dense"}, {"chunk_id": "dense"}]
+    sparse = [{"chunk_id": "sparse"}]
+
+    equal = eval_retrieval._weighted_rank_fusion(dense, sparse, 60, 3, 1.0, 1.0)
+    dense_weighted = eval_retrieval._weighted_rank_fusion(dense, sparse, 60, 3, 4.0, 1.0)
+
+    assert equal[0]["chunk_id"] == "other-dense"
+    assert equal[1]["chunk_id"] == "sparse"
+    assert [hit["chunk_id"] for hit in dense_weighted].index("dense") < [
+        hit["chunk_id"] for hit in dense_weighted
+    ].index("sparse")

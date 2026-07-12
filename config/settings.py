@@ -65,6 +65,25 @@ class LLMSettings:
 
 
 @dataclass(frozen=True)
+class LLMRoleSettings:
+    provider: str
+    model: str
+    base_url: str | None
+    api_key: str | None
+    max_tokens: int
+    temperature: float
+    timeout_seconds: int
+
+
+@dataclass(frozen=True)
+class LLMRolesSettings:
+    planner: LLMRoleSettings
+    draft: LLMRoleSettings
+    auditor: LLMRoleSettings
+    judge: LLMRoleSettings
+
+
+@dataclass(frozen=True)
 class RetrievalSettings:
     dense_top_k: int
     sparse_top_k: int
@@ -77,16 +96,44 @@ class RetrievalSettings:
     max_history_turns: int
     compression_trigger_chars: int
     compression_keep_recent_turns: int
+    hyde_score_threshold: float
+    hyde_margin_threshold: float
+    planner_cache_ttl_seconds: int
+    parent_backfill: bool
+    original_query_rrf_weight: float
+    dense_rrf_weight: float
+    sparse_rrf_weight: float
+
+
+@dataclass(frozen=True)
+class ChunkingSettings:
+    parent_tokens: int
+    child_tokens: int
+    overlap_tokens: int
+    version: str
+
+
+@dataclass(frozen=True)
+class StorageSettings:
+    database_url: str | None
+    sqlite_path: str | None
 
 
 @dataclass(frozen=True)
 class InferenceSettings:
     embedding_model_name: str
     reranker_model_name: str
+    reranker_enabled: bool
     embedding_service_url: str | None
     reranker_service_url: str | None
     request_timeout_seconds: int
     prefer_local_fallback: bool
+    nli_model_name: str
+    nli_service_url: str | None
+    nli_entailment_threshold: float
+    nli_enabled: bool
+    embedding_batch_size: int
+    embedding_max_length: int
 
 
 @dataclass(frozen=True)
@@ -102,8 +149,11 @@ class Settings:
     paths: PathSettings
     milvus: MilvusSettings
     llm: LLMSettings
+    llm_roles: LLMRolesSettings
     retrieval: RetrievalSettings
+    chunking: ChunkingSettings
     inference: InferenceSettings
+    storage: StorageSettings
     app: AppSettings
     anthropic_api_key: str | None
     anthropic_base_url: str | None
@@ -186,6 +236,23 @@ def get_settings() -> Settings:
     project_root = resolve_project_root()
     paths = _resolve_paths(project_root)
 
+    legacy_model = os.getenv("ANTHROPIC_MODEL", "claude-opus-4-7")
+    legacy_base_url = (os.getenv("ANTHROPIC_BASE_URL") or "").strip() or None
+    legacy_api_key = (os.getenv("ANTHROPIC_API_KEY") or "").strip() or None
+
+    def _role(prefix: str, default_model: str, default_max_tokens: int) -> LLMRoleSettings:
+        provider = os.getenv(f"{prefix}_LLM_PROVIDER", os.getenv("LLM_PROVIDER", "anthropic")).lower()
+        provider_default_model = legacy_model if provider == "anthropic" else default_model
+        return LLMRoleSettings(
+            provider=provider,
+            model=os.getenv(f"{prefix}_LLM_MODEL", provider_default_model),
+            base_url=(os.getenv(f"{prefix}_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or legacy_base_url or "").strip() or None,
+            api_key=(os.getenv(f"{prefix}_LLM_API_KEY") or os.getenv("LLM_API_KEY") or legacy_api_key or "").strip() or None,
+            max_tokens=int(os.getenv(f"{prefix}_LLM_MAX_TOKENS", str(default_max_tokens))),
+            temperature=float(os.getenv(f"{prefix}_LLM_TEMPERATURE", "0")),
+            timeout_seconds=int(os.getenv(f"{prefix}_LLM_TIMEOUT_SECONDS", "120")),
+        )
+
     return Settings(
         paths=paths,
         milvus=MilvusSettings(
@@ -195,7 +262,7 @@ def get_settings() -> Settings:
             password=os.getenv("MILVUS_PASSWORD", ""),
             database=os.getenv("MILVUS_DATABASE", "default"),
             alias=os.getenv("MILVUS_ALIAS", "default"),
-            collection_name=os.getenv("MILVUS_COLLECTION", "regtech_compliance_chunks"),
+            collection_name=os.getenv("MILVUS_COLLECTION", "regtech_compliance_chunks_v2"),
             consistency_level=os.getenv("MILVUS_CONSISTENCY_LEVEL", "Session"),
             dense_index_type=os.getenv("MILVUS_DENSE_INDEX_TYPE", "HNSW"),
             sparse_index_type=os.getenv("MILVUS_SPARSE_INDEX_TYPE", "SPARSE_INVERTED_INDEX"),
@@ -204,7 +271,7 @@ def get_settings() -> Settings:
             search_probe=int(os.getenv("MILVUS_SEARCH_PROBE", "64")),
         ),
         llm=LLMSettings(
-            model=os.getenv("ANTHROPIC_MODEL", "claude-opus-4-7"),
+            model=legacy_model,
             max_tokens=int(os.getenv("ANTHROPIC_MAX_TOKENS", "4000")),
             effort=os.getenv("ANTHROPIC_EFFORT", "high"),
             enable_adaptive_thinking=os.getenv("ANTHROPIC_ENABLE_THINKING", "true").lower() == "true",
@@ -213,26 +280,59 @@ def get_settings() -> Settings:
             compaction_beta=os.getenv("ANTHROPIC_COMPACTION_BETA", "compact-2026-01-12"),
             prompt_cache_ttl=os.getenv("ANTHROPIC_PROMPT_CACHE_TTL", "1h"),
         ),
+        llm_roles=LLMRolesSettings(
+            planner=_role("PLANNER", "Qwen/Qwen2.5-7B-Instruct", 1024),
+            draft=_role("DRAFT", "Qwen/Qwen2.5-72B-Instruct-AWQ", 4000),
+            auditor=_role("AUDITOR", "Qwen/Qwen2.5-72B-Instruct-AWQ", 2000),
+            judge=_role("JUDGE", "Qwen/Qwen2.5-72B-Instruct-AWQ", 2000),
+        ),
         retrieval=RetrievalSettings(
             dense_top_k=int(os.getenv("RETRIEVAL_DENSE_TOP_K", "50")),
             sparse_top_k=int(os.getenv("RETRIEVAL_SPARSE_TOP_K", "50")),
             rrf_top_k=int(os.getenv("RETRIEVAL_RRF_TOP_K", "20")),
             rerank_top_k=int(os.getenv("RETRIEVAL_RERANK_TOP_K", "8")),
             rrf_k=int(os.getenv("RETRIEVAL_RRF_K", "60")),
-            rerank_score_threshold=float(os.getenv("RETRIEVAL_RERANK_SCORE_THRESHOLD", "0.25")),
+            rerank_score_threshold=float(os.getenv("RETRIEVAL_RERANK_SCORE_THRESHOLD", "0.0")),
             max_audit_iterations=int(os.getenv("MAX_AUDIT_ITERATIONS", "3")),
             async_workers=int(os.getenv("ASYNC_RETRIEVAL_WORKERS", "4")),
             max_history_turns=int(os.getenv("MAX_HISTORY_TURNS", "12")),
             compression_trigger_chars=int(os.getenv("HISTORY_COMPRESSION_TRIGGER_CHARS", "12000")),
             compression_keep_recent_turns=int(os.getenv("HISTORY_KEEP_RECENT_TURNS", "4")),
+            hyde_score_threshold=float(os.getenv("HYDE_SCORE_THRESHOLD", "0.25")),
+            hyde_margin_threshold=float(os.getenv("HYDE_MARGIN_THRESHOLD", "0.05")),
+            planner_cache_ttl_seconds=int(os.getenv("PLANNER_CACHE_TTL_SECONDS", "300")),
+            parent_backfill=os.getenv("RETRIEVAL_PARENT_BACKFILL", "true").lower() == "true",
+            original_query_rrf_weight=float(os.getenv("ORIGINAL_QUERY_RRF_WEIGHT", "2.0")),
+            dense_rrf_weight=float(os.getenv("DENSE_RRF_WEIGHT", "1.0")),
+            sparse_rrf_weight=float(os.getenv("SPARSE_RRF_WEIGHT", "1.0")),
+        ),
+        chunking=ChunkingSettings(
+            parent_tokens=int(os.getenv("CHUNK_PARENT_TOKENS", "1500")),
+            child_tokens=int(os.getenv("CHUNK_CHILD_TOKENS", "400")),
+            overlap_tokens=int(os.getenv("CHUNK_OVERLAP_TOKENS", "200")),
+            version=os.getenv("CHUNK_VERSION", "semantic-v2"),
         ),
         inference=InferenceSettings(
             embedding_model_name=os.getenv("EMBEDDING_MODEL_NAME", "BAAI/bge-m3"),
             reranker_model_name=os.getenv("RERANKER_MODEL_NAME", "BAAI/bge-reranker-large"),
+            reranker_enabled=os.getenv("RERANKER_ENABLED", "true").lower() == "true",
             embedding_service_url=(os.getenv("EMBEDDING_SERVICE_URL") or "").strip() or None,
             reranker_service_url=(os.getenv("RERANKER_SERVICE_URL") or "").strip() or None,
             request_timeout_seconds=int(os.getenv("INFERENCE_REQUEST_TIMEOUT_SECONDS", "60")),
             prefer_local_fallback=os.getenv("PREFER_LOCAL_INFERENCE_FALLBACK", "true").lower() == "true",
+            nli_model_name=os.getenv(
+                "NLI_MODEL_NAME",
+                "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli",
+            ),
+            nli_service_url=(os.getenv("NLI_SERVICE_URL") or "").strip() or None,
+            nli_entailment_threshold=float(os.getenv("NLI_ENTAILMENT_THRESHOLD", "0.75")),
+            nli_enabled=os.getenv("NLI_ENABLED", "true").lower() == "true",
+            embedding_batch_size=int(os.getenv("EMBEDDING_BATCH_SIZE", "16")),
+            embedding_max_length=int(os.getenv("EMBEDDING_MAX_LENGTH", "2048")),
+        ),
+        storage=StorageSettings(
+            database_url=(os.getenv("DATABASE_URL") or "").strip() or None,
+            sqlite_path=(os.getenv("SQLITE_PATH") or "").strip() or None,
         ),
         app=AppSettings(
             log_level=os.getenv("LOG_LEVEL", "INFO"),
@@ -246,7 +346,13 @@ def get_settings() -> Settings:
     )
 
 
-def get_anthropic_client(settings: Settings | None = None) -> "Anthropic":
+def get_anthropic_client(
+    settings: Settings | None = None,
+    *,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    timeout_seconds: int | None = None,
+) -> "Anthropic":
     """Create an Anthropic client with header-stripping transport for proxy compatibility."""
     import httpx
     from anthropic import Anthropic
@@ -265,9 +371,12 @@ def get_anthropic_client(settings: Settings | None = None) -> "Anthropic":
 
     resolved = settings or get_settings()
     return Anthropic(
-        api_key=resolved.anthropic_api_key,
-        base_url=resolved.anthropic_base_url or None,
-        http_client=httpx.Client(transport=_CleanTransport(), timeout=resolved.inference.request_timeout_seconds),
+        api_key=api_key or resolved.anthropic_api_key,
+        base_url=base_url or resolved.anthropic_base_url or None,
+        http_client=httpx.Client(
+            transport=_CleanTransport(),
+            timeout=timeout_seconds or resolved.inference.request_timeout_seconds,
+        ),
     )
 
 
@@ -276,9 +385,13 @@ __all__ = [
     "ConfigurationError",
     "InferenceSettings",
     "LLMSettings",
+    "LLMRoleSettings",
+    "LLMRolesSettings",
     "MilvusSettings",
     "PathSettings",
     "RetrievalSettings",
+    "ChunkingSettings",
+    "StorageSettings",
     "Settings",
     "configure_logging",
     "ensure_sqlite_compatibility",

@@ -21,9 +21,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from config.settings import configure_logging, get_anthropic_client, get_settings
+from config.settings import configure_logging, get_settings
 from src.agent import ComplianceAgentGraph
 from src.indexing import BGEM3EmbeddingClient, MilvusHybridStore
+from src.inference import create_llm_client
 from src.retrieval import ComplianceRetrievalPipeline, CrossEncoderRerankerClient
 
 logger = logging.getLogger(__name__)
@@ -100,29 +101,14 @@ if BaseRagasLLM is not None and Generation is not None and LLMResult is not None
             temperature: float = 1e-8,
             stop: list[str] | None = None,
         ) -> str:
-            request: dict[str, Any] = {
-                "model": self.model_name,
-                "max_tokens": self.max_tokens,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are a strict evaluator for a regulated-finance retrieval benchmark. "
-                            "Follow the prompt exactly and return only the requested output."
-                        ),
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "messages": [{"role": "user", "content": _prompt_to_text(prompt)}],
-                "output_config": {"effort": self.effort},
-            }
-            if temperature is not None:
-                request["temperature"] = temperature
-            if stop:
-                request["stop_sequences"] = stop
-
-            response = self._client.messages.create(**request)
-            text = _response_text(getattr(response, "content", []))
+            response = self._client.complete(
+                system=(
+                    "You are a strict evaluator for a regulated-finance retrieval benchmark. "
+                    "Follow the prompt exactly and return only the requested output."
+                ),
+                prompt=_prompt_to_text(prompt),
+            )
+            text = response.text
             if _DEBUG_RAGAS:
                 logger.info(
                     "RAGAS_DEBUG _request_text -> chars=%d empty=%s stop=%s",
@@ -203,29 +189,14 @@ else:
             temperature: float = 1e-8,
             stop: list[str] | None = None,
         ) -> str:
-            request: dict[str, Any] = {
-                "model": self.model_name,
-                "max_tokens": self.max_tokens,
-                "system": [
-                    {
-                        "type": "text",
-                        "text": (
-                            "You are a strict evaluator for a regulated-finance retrieval benchmark. "
-                            "Follow the prompt exactly and return only the requested output."
-                        ),
-                        "cache_control": {"type": "ephemeral"},
-                    }
-                ],
-                "messages": [{"role": "user", "content": _prompt_to_text(prompt)}],
-                "output_config": {"effort": self.effort},
-            }
-            if temperature is not None:
-                request["temperature"] = temperature
-            if stop:
-                request["stop_sequences"] = stop
-
-            response = self._client.messages.create(**request)
-            return _response_text(getattr(response, "content", []))
+            response = self._client.complete(
+                system=(
+                    "You are a strict evaluator for a regulated-finance retrieval benchmark. "
+                    "Follow the prompt exactly and return only the requested output."
+                ),
+                prompt=_prompt_to_text(prompt),
+            )
+            return response.text
 
         def generate_text(
             self,
@@ -366,10 +337,11 @@ def build_agent_stack(
     embedding_client = BGEM3EmbeddingClient(settings.inference.embedding_model_name)
 
     reranker = None
-    try:
-        reranker = CrossEncoderRerankerClient(settings.inference.reranker_model_name)
-    except Exception as exc:  # noqa: BLE001
-        logger.warning("Reranker unavailable, using dense-only retrieval mode: %s", exc)
+    if settings.inference.reranker_enabled:
+        try:
+            reranker = CrossEncoderRerankerClient(settings.inference.reranker_model_name)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Reranker unavailable, using RRF retrieval mode: %s", exc)
 
     pipeline = ComplianceRetrievalPipeline(
         store=store,
@@ -426,6 +398,9 @@ def run_generation_eval(
             "answer": answer,
             "contexts": contexts,
             "ground_truth": str(item.get("ground_truth_answer", "") or "").strip(),
+            "audit_status": str(getattr(result, "audit_status", "pending")),
+            "claims": list(getattr(result, "claims", []) or []),
+            "grounding_scores": dict(getattr(result, "grounding_scores", {}) or {}),
         }
         if _DEBUG_RAGAS:
             logger.info(
@@ -532,12 +507,12 @@ def _evaluate_ragas(
 
     hf_dataset = Dataset.from_list(records)
 
-    llm_client = get_anthropic_client(settings)
+    llm_client = create_llm_client(settings.llm_roles.judge, settings)
     llm = AnthropicRagasLLM(
         llm_client,
-        settings.llm.model,
-        settings.llm.max_tokens,
-        settings.llm.effort,
+        settings.llm_roles.judge.model,
+        settings.llm_roles.judge.max_tokens,
+        "high",
     )
     embeddings = BGEM3RagasEmbeddings(embedding_client)
 
@@ -568,6 +543,29 @@ def _evaluate_ragas(
     }
 
 
+def _safety_scores(records: list[dict[str, Any]], threshold: float) -> dict[str, float]:
+    total_claims = 0
+    cited_claims = 0
+    nli_scores: list[float] = []
+    unsafe_passes = 0
+    for record in records:
+        for claim in record.get("claims", []):
+            total_claims += 1
+            if claim.get("source_ids"):
+                cited_claims += 1
+        scores = [float(value) for value in record.get("grounding_scores", {}).values()]
+        nli_scores.extend(scores)
+        if record.get("audit_status") == "approved" and any(score < threshold for score in scores):
+            unsafe_passes += 1
+    return {
+        "citation_precision": cited_claims / total_claims if total_claims else 1.0,
+        "unsupported_sentence_rate": (
+            sum(score < threshold for score in nli_scores) / len(nli_scores) if nli_scores else 0.0
+        ),
+        "unsafe_auditor_pass_rate": unsafe_passes / len(records) if records else 0.0,
+    }
+
+
 def write_results(output_dir: Path, scores: dict[str, float], evaluated_count: int) -> Path | None:
     """Persist evaluation summary to JSON."""
     payload = {
@@ -592,12 +590,16 @@ def main() -> None:
     settings = get_settings()
     configure_logging(settings.app.log_level)
 
-    queries_path = Path(__file__).resolve().parent / "test_queries.json"
-    if not queries_path.exists():
-        logger.error("Test queries file not found: %s", queries_path)
-        raise SystemExit(1)
-
-    test_queries = load_test_queries(queries_path)
+    suite_dir = Path(__file__).resolve().parent
+    query_files = [suite_dir / "test_queries.json"]
+    if os.getenv("EVAL_SUITE", "single").lower() == "all":
+        query_files.extend([suite_dir / "test_queries_en.json", suite_dir / "test_queries_hk_mixed.json"])
+    test_queries: list[dict[str, Any]] = []
+    for queries_path in query_files:
+        if not queries_path.exists():
+            logger.error("Test queries file not found: %s", queries_path)
+            raise SystemExit(1)
+        test_queries.extend(load_test_queries(queries_path))
     agent_graph, pipeline, embedding_client = build_agent_stack(settings)
 
     records = run_generation_eval(test_queries, agent_graph)
@@ -607,6 +609,7 @@ def main() -> None:
 
     try:
         scores = _evaluate_ragas(records, settings, embedding_client)
+        scores.update(_safety_scores(records, settings.inference.nli_entailment_threshold))
     except Exception as exc:  # noqa: BLE001
         logger.error("RAGAs evaluation failed: %s", exc)
         raise SystemExit(1)

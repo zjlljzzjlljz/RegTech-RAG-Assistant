@@ -5,30 +5,33 @@ STREAMLIT := $(VENV)/bin/streamlit
 STREAMLIT_ENV := STREAMLIT_BROWSER_GATHER_USAGE_STATS=false
 STREAMLIT_FLAGS := --server.headless=true --browser.gatherUsageStats=false
 
-.PHONY: install build build-llamaindex test app app-v2 app-v3 clean
+.PHONY: install test app rebuild-milvus eval-retrieval eval-generation migrate compose-up clean
 
 install:
 	@test -x $(PIP) || (echo "Project virtual environment not found at $(VENV). Please create .venv first with a compatible Python interpreter." && exit 1)
 	$(PIP) install --upgrade pip setuptools wheel
 	$(PIP) install -r requirements.txt
 
-build:
-	$(PYTHON) 1_build_db.py
-
-build-llamaindex:
-	$(PYTHON) 4_llamaindex_ingest.py
-
 test:
-	$(PYTHON) 2_test_db.py
+	$(PYTHON) -m pytest -q
 
 app:
-	$(STREAMLIT_ENV) $(STREAMLIT) run 3_app.py $(STREAMLIT_FLAGS)
+	$(STREAMLIT_ENV) $(STREAMLIT) run app.py $(STREAMLIT_FLAGS)
 
-app-v2:
-	$(STREAMLIT_ENV) $(STREAMLIT) run 8_app.py $(STREAMLIT_FLAGS)
+rebuild-milvus:
+	$(PYTHON) -m src.indexing.rebuild_milvus --pdf-dir data/raw_pdfs --drop-existing
 
-app-v3:
-	$(STREAMLIT_ENV) $(STREAMLIT) run 10_app.py --server.port=8503 $(STREAMLIT_FLAGS)
+eval-retrieval:
+	$(PYTHON) -m src.evaluation.eval_retrieval --suite all --fusion rrf --with-rerank
+
+eval-generation:
+	EVAL_SUITE=all $(PYTHON) -m src.evaluation.eval_generation
+
+migrate:
+	$(VENV)/bin/alembic upgrade head
+
+compose-up:
+	docker compose --profile app --profile gpu up -d
 
 clean:
 	rm -rf chroma_db/

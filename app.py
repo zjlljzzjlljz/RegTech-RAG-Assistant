@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import logging
 import time
+import uuid
 from typing import Any
 
 import streamlit as st
@@ -11,7 +12,7 @@ from config.settings import configure_logging, get_settings
 from src.agent import AuditResult, ComplianceAgentGraph
 from src.indexing import BGEM3EmbeddingClient, MilvusHybridStore
 from src.retrieval import ComplianceRetrievalPipeline, CrossEncoderRerankerClient
-from src.storage import TransactionLog, TransactionRepository
+from src.storage import TransactionLog, create_transaction_repository
 
 LOGGER = logging.getLogger(__name__)
 _DEFAULT_QUERY = "What are the key AML/KYC compliance requirements for cross-border transactions in Hong Kong?"
@@ -26,7 +27,6 @@ def get_agent_graph() -> ComplianceAgentGraph:
     store = MilvusHybridStore(settings)
     embedding_client = BGEM3EmbeddingClient(settings.inference.embedding_model_name)
 
-    # Reranker may still be downloading — try with timeout
     _reranker_result: dict[str, Any] = {}
 
     def _load_reranker() -> None:
@@ -35,13 +35,15 @@ def get_agent_graph() -> ComplianceAgentGraph:
         except Exception:  # noqa: BLE001
             pass
 
-    _thread = _threading.Thread(target=_load_reranker, daemon=True)
-    _thread.start()
-    _thread.join(timeout=30)
+    _thread = None
+    if settings.inference.reranker_enabled:
+        _thread = _threading.Thread(target=_load_reranker, daemon=True)
+        _thread.start()
+        _thread.join(timeout=30)
 
     reranker = _reranker_result.get("reranker")
-    if reranker is None:
-        if _thread.is_alive():
+    if settings.inference.reranker_enabled and reranker is None:
+        if _thread is not None and _thread.is_alive():
             LOGGER.warning("Reranker model downloading — using dense-only mode for now")
         else:
             LOGGER.warning("Reranker unavailable — using dense-only mode")
@@ -63,7 +65,7 @@ def _ensure_singletons() -> ComplianceAgentGraph:
         st.session_state.compliance_agent_graph = get_agent_graph()
     if "transaction_repository" not in st.session_state:
         try:
-            st.session_state.transaction_repository = TransactionRepository()
+            st.session_state.transaction_repository = create_transaction_repository()
         except Exception as exc:  # noqa: BLE001
             LOGGER.warning("Transaction repository unavailable: %s", exc)
             st.session_state.transaction_repository = None
@@ -90,6 +92,8 @@ def _render_token_metrics(token_metrics: dict[str, int]) -> None:
 
 
 def _render_result(result: AuditResult) -> None:
+    if result.audit_status != "approved":
+        st.warning(f"Audit status: {result.audit_status}")
     if result.error:
         st.error(result.error)
 
@@ -169,10 +173,11 @@ def _run_audit(query: str) -> AuditResult:
     try:
         repo = st.session_state.get("transaction_repository")
         if repo is None:
-            repo = TransactionRepository()
+            repo = create_transaction_repository()
             st.session_state.transaction_repository = repo
 
         log = TransactionLog(
+            request_id=str(uuid.uuid4()),
             query=query,
             answer=result.answer,
             claims_json=json.dumps(result.claims, ensure_ascii=False),
@@ -182,6 +187,19 @@ def _run_audit(query: str) -> AuditResult:
             total_tokens=int(result.token_metrics.get("total_tokens", 0)),
             iterations=int(getattr(result, "iterations", 0) or 0),
             latency_ms=latency_ms,
+            audit_status=result.audit_status,
+            model_versions_json=json.dumps(
+                {
+                    "planner": get_settings().llm_roles.planner.model,
+                    "draft": get_settings().llm_roles.draft.model,
+                    "auditor": get_settings().llm_roles.auditor.model,
+                },
+                ensure_ascii=False,
+            ),
+            evidence_ids_json=json.dumps(
+                [chunk.chunk_id for chunk in (result.retrieved_chunks or [])],
+                ensure_ascii=False,
+            ),
         )
         st.session_state.last_log_id = repo.insert(log)
     except Exception as exc:  # noqa: BLE001

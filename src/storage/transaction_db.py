@@ -24,6 +24,10 @@ class TransactionLog:
     total_tokens: int = 0
     iterations: int = 0
     latency_ms: float = 0.0
+    request_id: str | None = None
+    audit_status: str = "pending"
+    model_versions_json: str = "{}"
+    evidence_ids_json: str = "[]"
     id: int | None = None
     created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat())
 
@@ -42,6 +46,10 @@ class TransactionLog:
             total_tokens=row["total_tokens"],
             iterations=row["iterations"],
             latency_ms=row["latency_ms"],
+            request_id=row["request_id"] if "request_id" in row.keys() else None,
+            audit_status=row["audit_status"] if "audit_status" in row.keys() else "pending",
+            model_versions_json=row["model_versions_json"] if "model_versions_json" in row.keys() else "{}",
+            evidence_ids_json=row["evidence_ids_json"] if "evidence_ids_json" in row.keys() else "[]",
             created_at=row["created_at"],
         )
 
@@ -96,14 +104,26 @@ class TransactionRepository:
                     total_tokens        INTEGER NOT NULL DEFAULT 0,
                     iterations          INTEGER NOT NULL DEFAULT 0,
                     latency_ms          REAL    NOT NULL DEFAULT 0.0,
+                    request_id          TEXT,
+                    audit_status        TEXT    NOT NULL DEFAULT 'pending',
+                    model_versions_json TEXT    NOT NULL DEFAULT '{}',
+                    evidence_ids_json   TEXT    NOT NULL DEFAULT '[]',
                     created_at          TEXT    NOT NULL DEFAULT (datetime('now'))
                 )
                 """
             )
-            try:
-                conn.execute("ALTER TABLE transaction_logs ADD COLUMN feedback TEXT")
-            except sqlite3.OperationalError:
-                pass
+            migrations = [
+                "ALTER TABLE transaction_logs ADD COLUMN feedback TEXT",
+                "ALTER TABLE transaction_logs ADD COLUMN request_id TEXT",
+                "ALTER TABLE transaction_logs ADD COLUMN audit_status TEXT NOT NULL DEFAULT 'pending'",
+                "ALTER TABLE transaction_logs ADD COLUMN model_versions_json TEXT NOT NULL DEFAULT '{}'",
+                "ALTER TABLE transaction_logs ADD COLUMN evidence_ids_json TEXT NOT NULL DEFAULT '[]'",
+            ]
+            for statement in migrations:
+                try:
+                    conn.execute(statement)
+                except sqlite3.OperationalError:
+                    pass
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_transaction_logs_created_at "
                 "ON transaction_logs(created_at DESC)"
@@ -127,8 +147,9 @@ class TransactionRepository:
                     INSERT INTO transaction_logs
                         (query, answer, claims_json, feedback, error_message,
                          prompt_tokens, completion_tokens, total_tokens,
-                         iterations, latency_ms, created_at)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                         iterations, latency_ms, request_id, audit_status,
+                         model_versions_json, evidence_ids_json, created_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         log.query,
@@ -141,6 +162,10 @@ class TransactionRepository:
                         log.total_tokens,
                         log.iterations,
                         log.latency_ms,
+                        log.request_id,
+                        log.audit_status,
+                        log.model_versions_json,
+                        log.evidence_ids_json,
                         log.created_at,
                     ),
                 )

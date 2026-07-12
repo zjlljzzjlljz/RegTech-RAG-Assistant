@@ -8,11 +8,13 @@ from pathlib import Path
 from typing import Any
 
 import fitz
+import httpx
 import numpy as np
 from pymilvus import AnnSearchRequest, Collection, CollectionSchema, DataType, FieldSchema, MilvusClient, connections, utility
 
 from config.settings import Settings, get_settings
 from src.indexing.sparse_tokenizer import tokenize_and_weight
+from src.indexing.semantic_chunker import SemanticChunker
 
 logger = logging.getLogger(__name__)
 
@@ -39,69 +41,92 @@ class BGEEmbeddingResult:
 
 
 class BGEM3EmbeddingClient:
-    """Local BGEM3 client with a simplified sparse representation fallback."""
+    """BGE-M3 hybrid encoder with native lexical weights on both write and query paths."""
 
     def __init__(self, model_name: str | None = None) -> None:
-        from sentence_transformers import SentenceTransformer as _ST
-
         settings = get_settings()
         self.model_name = model_name or settings.inference.embedding_model_name
-        self._ST = _ST
-        self.model = _ST(self.model_name, trust_remote_code=True)
+        self.service_url = settings.inference.embedding_service_url
+        self.timeout = settings.inference.request_timeout_seconds
+        self.batch_size = settings.inference.embedding_batch_size
+        self.max_length = settings.inference.embedding_max_length
+        self.allow_legacy_fallback = settings.inference.prefer_local_fallback
+        self.model: Any = None
+        self._native_sparse = False
+        if not self.service_url:
+            try:
+                from FlagEmbedding import BGEM3FlagModel
+
+                self.model = BGEM3FlagModel(self.model_name, use_fp16=True)
+                self._native_sparse = True
+            except Exception as exc:
+                if not self.allow_legacy_fallback:
+                    raise DependencyUnavailableError(
+                        "BGE-M3 native sparse encoder is unavailable; install FlagEmbedding "
+                        "or configure EMBEDDING_SERVICE_URL"
+                    ) from exc
+                from sentence_transformers import SentenceTransformer
+
+                logger.warning("Using legacy deterministic sparse fallback: %s", exc)
+                self.model = SentenceTransformer(self.model_name, trust_remote_code=True)
 
     def encode(self, text: str, prompt: str | None = None) -> BGEEmbeddingResult:
-        kwargs: dict[str, Any] = {"normalize_embeddings": True}
-        if prompt:
-            kwargs["prompt"] = prompt
-        dense_raw = self.model.encode(text, **kwargs)
-        if dense_raw.ndim == 2:
-            dense_vec = dense_raw[0].tolist()
-        else:
-            dense_vec = dense_raw.tolist()
-        sparse_vec = self._build_sparse_vector_fallback(text)
-        return BGEEmbeddingResult(dense_vector=dense_vec, sparse_vector=sparse_vec)
+        return self.encode_many([text], prompt=prompt)[0]
 
     def encode_many(self, texts: list[str], prompt: str | None = None) -> list[BGEEmbeddingResult]:
         if not texts:
             return []
-        kwargs: dict[str, Any] = {"normalize_embeddings": True}
-        if prompt:
-            kwargs["prompt"] = prompt
-        dense_arrays = self.model.encode(texts, **kwargs)
+        if self.service_url:
+            output: list[BGEEmbeddingResult] = []
+            for start in range(0, len(texts), self.batch_size):
+                response = httpx.post(
+                    f"{self.service_url.rstrip('/')}/encode",
+                    json={
+                        "texts": texts[start : start + self.batch_size],
+                        "batch_size": self.batch_size,
+                        "max_length": self.max_length,
+                    },
+                    timeout=self.timeout,
+                )
+                response.raise_for_status()
+                payload = response.json()
+                if payload.get("model") != self.model_name:
+                    raise DependencyUnavailableError(
+                        f"Embedding service model mismatch: expected {self.model_name}, got {payload.get('model')}"
+                    )
+                output.extend(
+                    BGEEmbeddingResult(
+                        dense_vector=[float(value) for value in item["dense_vector"]],
+                        sparse_vector={int(key): float(value) for key, value in item["sparse_vector"].items()},
+                    )
+                    for item in payload["embeddings"]
+                )
+            return output
+
+        if self._native_sparse:
+            result = self.model.encode(
+                texts,
+                batch_size=self.batch_size,
+                max_length=self.max_length,
+                return_dense=True,
+                return_sparse=True,
+                return_colbert_vecs=False,
+            )
+            dense_arrays = result["dense_vecs"]
+            sparse_arrays = result["lexical_weights"]
+        else:
+            dense_arrays = self.model.encode(texts, normalize_embeddings=True)
+            sparse_arrays = [self._build_sparse_vector_fallback(text) for text in texts]
         output: list[BGEEmbeddingResult] = []
-        for i, text in enumerate(texts):
+        for i, _text in enumerate(texts):
             dense_vec = np.asarray(dense_arrays[i], dtype=np.float32).tolist()
-            sparse_vec = self._build_sparse_vector_fallback(text)
+            raw_sparse = sparse_arrays[i]
+            sparse_vec = {int(key): float(value) for key, value in raw_sparse.items()}
             output.append(BGEEmbeddingResult(dense_vector=dense_vec, sparse_vector=sparse_vec))
         return output
 
-    def _build_sparse_vector_from_result(self, result: dict[str, Any]) -> dict[int, float]:
-        """Extract sparse vector from BGE-M3 encode result, with fallback."""
-        try:
-            sparse = result.get("sparse")
-            if sparse is None:
-                raise ValueError("No sparse key in result")
-
-            # scipy sparse matrix: convert to {idx: weight} dict
-            from scipy.sparse import issparse
-
-            if issparse(sparse):
-                coo = sparse.tocoo()
-                return {int(idx): float(val) for idx, val in zip(coo.col, coo.data)}
-            # dict format: {"indices": [...], "values": [...]} or {str: float}
-            if isinstance(sparse, dict):
-                indices = sparse.get("indices") or []
-                values = sparse.get("values") or []
-                if indices and values:
-                    return {int(idx): float(val) for idx, val in zip(indices, values)}
-        except Exception:
-            pass
-        # Fallback: use shared deterministic tokenizer
-        return self._build_sparse_vector_fallback("")
-
     def _build_sparse_vector(self, text: str) -> dict[int, float]:
-        """Build sparse vector for *text* using the shared deterministic tokenizer."""
-        return tokenize_and_weight(text)
+        return self.encode(text).sparse_vector
 
     def _build_sparse_vector_fallback(self, text: str) -> dict[int, float]:
         """Build sparse vector using the shared deterministic tokenizer.
@@ -219,6 +244,32 @@ class MilvusHybridStore:
         self.collection.flush()
         return int(result.insert_count)
 
+    def get_chunks_by_ids(self, chunk_ids: list[str]) -> list[dict[str, Any]]:
+        if not chunk_ids:
+            return []
+        escaped = [chunk_id.replace('"', '\\"') for chunk_id in chunk_ids]
+        expr = "chunk_id in [" + ",".join(f'"{chunk_id}"' for chunk_id in escaped) + "]"
+        rows = self.collection.query(
+            expr=expr,
+            output_fields=[
+                "chunk_id",
+                "parent_id",
+                "chunk_type",
+                "source_file",
+                "page_number",
+                "text",
+                "metadata_json",
+            ],
+        )
+        return [
+            {
+                **row,
+                "page_number": None if row.get("page_number") == -1 else row.get("page_number"),
+                "metadata": json.loads(row.get("metadata_json") or "{}"),
+            }
+            for row in rows
+        ]
+
     def hybrid_search(
         self,
         dense_vector: list[float],
@@ -319,7 +370,13 @@ class MilvusIndexer:
     ) -> None:
         self.settings = get_settings()
         self.store = store or MilvusHybridStore(self.settings)
-        self.embedding_client = embedding_client or BGEM3EmbeddingClient()
+        self._embedding_client = embedding_client
+
+    @property
+    def embedding_client(self) -> BGEM3EmbeddingClient:
+        if self._embedding_client is None:
+            self._embedding_client = BGEM3EmbeddingClient()
+        return self._embedding_client
 
     def parse_pdf(self, pdf_path: str | Path) -> list[dict[str, Any]]:
         document = fitz.open(pdf_path)
@@ -339,59 +396,56 @@ class MilvusIndexer:
     def build_parent_child_chunks(
         self,
         pages: list[dict[str, Any]],
-        parent_size: int = 1500,
-        child_size: int = 400,
+        parent_size: int | None = None,
+        child_size: int | None = None,
+        overlap_size: int | None = None,
+        document_id: str = "unknown-document",
     ) -> list[IndexedChunk]:
+        chunker = SemanticChunker(
+            parent_tokens=parent_size or self.settings.chunking.parent_tokens,
+            child_tokens=child_size or self.settings.chunking.child_tokens,
+            overlap_tokens=(
+                self.settings.chunking.overlap_tokens if overlap_size is None else overlap_size
+            ),
+            version=self.settings.chunking.version,
+        )
         chunks: list[IndexedChunk] = []
         for page in pages:
-            words = page["text"].split()
-            parent_index = 0
-            for start in range(0, len(words), parent_size):
-                parent_words = words[start : start + parent_size]
-                if not parent_words:
-                    continue
-                parent_id = f"page-{page['page_number']}-parent-{parent_index}"
-                parent_text = " ".join(parent_words)
+            semantic_chunks = chunker.split_page(
+                document_id=document_id,
+                page_number=page["page_number"],
+                text=page["text"],
+            )
+            for semantic_chunk in semantic_chunks:
                 chunks.append(
                     IndexedChunk(
-                        chunk_id=parent_id,
-                        parent_id=None,
-                        text=parent_text,
+                        chunk_id=semantic_chunk.chunk_id,
+                        parent_id=semantic_chunk.parent_id,
+                        text=semantic_chunk.text,
                         source_file="",
                         page_number=page["page_number"],
-                        chunk_type="parent",
-                        metadata={"page": page["page_number"]},
+                        chunk_type=semantic_chunk.chunk_type,
+                        metadata=dict(semantic_chunk.metadata),
                     )
                 )
-                child_index = 0
-                for child_start in range(0, len(parent_words), child_size):
-                    child_words = parent_words[child_start : child_start + child_size]
-                    if not child_words:
-                        continue
-                    child_id = f"{parent_id}-child-{child_index}"
-                    chunks.append(
-                        IndexedChunk(
-                            chunk_id=child_id,
-                            parent_id=parent_id,
-                            text=" ".join(child_words),
-                            source_file="",
-                            page_number=page["page_number"],
-                            chunk_type="child",
-                            metadata={"page": page["page_number"], "parent_id": parent_id},
-                        )
-                    )
-                    child_index += 1
-                parent_index += 1
         return chunks
 
     def ingest_pdf(self, pdf_path: str | Path) -> int:
         pdf_path = Path(pdf_path)
         pages = self.parse_pdf(pdf_path)
-        chunks = self.build_parent_child_chunks(pages)
+        chunks = self.build_parent_child_chunks(pages, document_id=pdf_path.name)
         for chunk in chunks:
             chunk.source_file = pdf_path.name
             chunk.metadata["source_file"] = pdf_path.name
-        embeddings = self.embedding_client.encode_many([chunk.text for chunk in chunks])
+            chunk.metadata["embedding_model"] = self.embedding_client.model_name
+        child_positions = [index for index, chunk in enumerate(chunks) if chunk.chunk_type == "child"]
+        child_embeddings = self.embedding_client.encode_many([chunks[index].text for index in child_positions])
+        if not child_embeddings:
+            raise DependencyUnavailableError(f"No child chunks were produced for {pdf_path.name}")
+        dimension = len(child_embeddings[0].dense_vector)
+        embeddings = [BGEEmbeddingResult([0.0] * dimension, {}) for _ in chunks]
+        for position, embedding in zip(child_positions, child_embeddings):
+            embeddings[position] = embedding
         inserted = self.store.insert_chunks(chunks, embeddings)
         logger.info("Indexed %s chunks from %s", inserted, pdf_path)
         return inserted

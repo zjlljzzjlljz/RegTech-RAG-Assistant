@@ -1,0 +1,218 @@
+[
+  {
+    "query": "What specific customer due diligence requirements apply to financial institutions in Hong Kong?",
+    "ground_truth_chunk_ids": [
+      "child-176ef35a9d2bedfaa45aa902",
+      "child-e234b774c5088bd61a34ebc3",
+      "child-667b3789515bf79365b8b220"
+    ],
+    "ground_truth_answer": "Hong Kong financial institutions must conduct customer due diligence in accordance with the AMLO and HKMA guidance, including at minimum identifying and verifying the customer and beneficial owner, understanding the purpose of the business relationship, and carrying out due diligence in the relevant statutory trigger situations."
+  },
+  {
+    "query": "In what circumstances must an authorized institution carry out customer due diligence, including the occasional transaction threshold?",
+    "ground_truth_chunk_ids": [
+      "child-8dbd18f908a02c0b7713807e",
+      "child-a617cb93657e96cb7938e130",
+      "child-1218c433e4cafc3a514bd25c"
+    ],
+    "ground_truth_answer": "An authorized institution must perform customer due diligence when establishing a business relationship, conducting an occasional transaction that reaches the statutory threshold, suspecting money laundering or terrorist financing, or doubting the accuracy or adequacy of previously obtained customer identification data."
+  },
+  {
+    "query": "How should a financial institution identify and verify the beneficial owner of a corporate customer?",
+    "ground_truth_chunk_ids": [
+      "child-b8f69585d9e7cb45f8ffc92b",
+      "child-4e171b6bb6585fb2ebcaa955",
+      "child-5acbeb91fde67a141494f256"
+    ],
+    "ground_truth_answer": "For a corporate customer, the institution should identify the natural person who ultimately owns or controls the corporation, as well as any natural person exercising control by other means, and take reasonable steps to verify that person's identity."
+  },
+  {
+    "query": "What enhanced due diligence measures should HKMA require for high-risk customers?",
+    "ground_truth_chunk_ids": [
+      "child-26cfaf422c1bd606d2b522b8",
+      "child-c103ed599c36b5e89e417afd",
+      "child-7fc415846c07a19b3d7e9baa"
+    ],
+    "ground_truth_answer": "For high-risk customers, the institution should apply enhanced due diligence, such as obtaining more customer information, understanding the purpose of the relationship, understanding the source of wealth and source of funds, and requiring the first payment to come through an account in the customer's own name where appropriate."
+  },
+  {
+    "query": "What additional approvals and checks are required before opening or maintaining a relationship with a non-Hong Kong PEP?",
+    "ground_truth_chunk_ids": [
+      "child-8f354472f726c6ae544a93fd",
+      "child-af81245c9632c7941da92e13"
+    ],
+    "ground_truth_answer": "If a customer or beneficial owner is a non-Hong Kong PEP, the institution should take reasonable measures to identify the person, obtain senior management approval, and take reasonable measures to establish the source of wealth and source of funds, while applying enhanced ongoing monitoring."
+  },
+  {
+    "query": "For a former non-Hong Kong PEP, must enhanced PEP measures continue to apply?",
+    "ground_truth_chunk_ids": [
+      "child-637f405bf1f1fa0933cb6f75",
+      "child-85dd0611cfcb823618f0d86d",
+      "child-8f354472f726c6ae544a93fd"
+    ],
+    "ground_truth_answer": "For a former non-Hong Kong PEP, the institution may decide after a risk-based assessment not to continue applying the enhanced measures used for current PEPs, provided the person no longer presents a higher money laundering or terrorist financing risk."
+  },
+  {
+    "query": "How should an authorized institution carry out ongoing transaction monitoring to identify unusual or complex transactions?",
+    "ground_truth_chunk_ids": [
+      "child-3e422edc312c1016f1df4ae5",
+      "child-501e2935b580704749a9fa22",
+      "child-6ef889138c3f406ab78b2f04"
+    ],
+    "ground_truth_answer": "An authorized institution should continuously monitor customer transactions to identify complex, unusually large, or unusual-pattern transactions that have no apparent economic or lawful purpose, and follow up with review and enquiries when needed."
+  },
+  {
+    "query": "How should transaction monitoring intensity be adjusted in high-risk and low-risk situations?",
+    "ground_truth_chunk_ids": [
+      "child-501e2935b580704749a9fa22"
+    ],
+    "ground_truth_answer": "In high-risk situations, the institution should strengthen transaction monitoring; in low-risk situations, it may reduce the extent or frequency of monitoring, provided it still remains sufficient to detect unusual transactions and suspicious activity."
+  },
+  {
+    "query": "After submitting a suspicious transaction report, what follow-up risk mitigation should the institution apply to the customer relationship?",
+    "ground_truth_chunk_ids": [
+      "child-25a3f565e9f097d3f27d655b",
+      "child-047a08ea124b3e8126be7507",
+      "child-081a8b0327ec6b698feca32f"
+    ],
+    "ground_truth_answer": "Submitting a suspicious transaction report does not mean the institution can stop managing the related risk; it must continue to assess customer relationship risk in light of any follow-up from the JFIU and apply appropriate mitigation measures."
+  },
+  {
+    "query": "What does HKMA require for the frequency and scope of sanctions list screening?",
+    "ground_truth_chunk_ids": [
+      "child-498a9b54e2ba10fa6fbea262",
+      "child-2f561c4deda98c93b1e7efbf",
+      "child-f76cdc3f6df6a9dbb6126047"
+    ],
+    "ground_truth_answer": "An authorized institution should maintain up-to-date sanctions and terrorist list databases and, on a risk-based basis, conduct ongoing screening of customers, related parties, and transactions; any potential match should be investigated, escalated, and controlled promptly."
+  },
+  {
+    "query": "Does sanctions and terrorist screening need to cover related parties and beneficial owners?",
+    "ground_truth_chunk_ids": [
+      "child-f76cdc3f6df6a9dbb6126047",
+      "child-498a9b54e2ba10fa6fbea262",
+      "child-2d401adc0c83305bc0f0edd6"
+    ],
+    "ground_truth_answer": "Yes. On a risk-based basis, the screening scope may extend to connected parties and the customer's beneficial owners, authorized signatories, or other relevant controlling parties to reduce sanctions evasion risk."
+  },
+  {
+    "query": "How should an authorized institution handle and escalate a possible name match?",
+    "ground_truth_chunk_ids": [
+      "child-f76cdc3f6df6a9dbb6126047",
+      "child-25a3f565e9f097d3f27d655b"
+    ],
+    "ground_truth_answer": "When a possible name match arises, the institution should have an effective process to determine whether it is a true match, freeze or block the relevant transaction where necessary, and escalate to the appropriate internal function and regulatory or law-enforcement channels."
+  },
+  {
+    "query": "Before establishing a correspondent banking relationship, what due diligence should an authorized institution perform on the respondent bank?",
+    "ground_truth_chunk_ids": [
+      "child-3f967842943978afec75e1fb",
+      "child-08bf9dc74267e0f1d2fd80f7",
+      "child-35b20096c7b4fabe4240583e"
+    ],
+    "ground_truth_answer": "Before establishing a cross-border correspondent banking relationship, an authorized institution should understand the respondent bank's business nature, reputation, regulatory environment, and AML/CFT controls, and assess whether those controls are effective enough."
+  },
+  {
+    "query": "Can an authorized institution establish a correspondent banking relationship before completing due diligence?",
+    "ground_truth_chunk_ids": [
+      "child-8df13e8c0ec282be7e05f2f7"
+    ],
+    "ground_truth_answer": "No. If the relevant due diligence measures have not been completed, the authorized institution should not establish a cross-border correspondent banking or similar relationship."
+  },
+  {
+    "query": "When the head office or an overseas branch performs correspondent banking due diligence on the institution's behalf, what conditions must the Hong Kong institution still meet?",
+    "ground_truth_chunk_ids": [
+      "child-a8a04bcd0ecf6a6c74681288"
+    ],
+    "ground_truth_answer": "Even if the institution relies on the group head office, parent bank, or overseas branch to help complete correspondent banking due diligence, it must still ensure the review complies with local AML/CFT requirements, the information is obtainable promptly, and group-level controls remain appropriate."
+  },
+  {
+    "query": "How can the Hong Kong banking sector use RegTech to improve AML/CFT compliance?",
+    "ground_truth_chunk_ids": [
+      "child-5cb70ad282e66585981f1e52",
+      "child-84bf6b59571b59145a5fbf5e",
+      "child-907172349c8d15f51177c31f"
+    ],
+    "ground_truth_answer": "The Hong Kong banking sector can use RegTech to improve AML/CFT compliance efficiency, for example through automated data analysis, rule engines, machine-learning monitoring, and more efficient alert triage to strengthen suspicious activity detection, investigation, and reporting."
+  },
+  {
+    "query": "What AML controls are required for remote onboarding of individual customers?",
+    "ground_truth_chunk_ids": [
+      "child-67e5c764d6e32226b349bccb",
+      "child-7fc415846c07a19b3d7e9baa",
+      "child-cc6f9874ff99283c32e5d465"
+    ],
+    "ground_truth_answer": "Remote onboarding of individual customers should use controls as robust as, or stronger than, face-to-face onboarding, including identity authentication, identity matching, risk assessment, document verification, and ongoing monitoring; if reliable identification cannot be completed, onboarding should not proceed."
+  },
+  {
+    "query": "What regulatory requirements apply when artificial intelligence is used for suspicious transaction monitoring?",
+    "ground_truth_chunk_ids": [
+      "child-907172349c8d15f51177c31f",
+      "child-84bf6b59571b59145a5fbf5e",
+      "child-3d2d234588266c2d92f470f5"
+    ],
+    "ground_truth_answer": "When using artificial intelligence for suspicious transaction monitoring, the institution must still meet the existing AML/CFT regulatory requirements, including clear governance responsibility, model validation, audit trail retention, ongoing monitoring of false positives and false negatives, and human review for high-risk cases."
+  },
+  {
+    "query": "What basic elements should an authorized institution's AML/CFT governance framework include?",
+    "ground_truth_chunk_ids": [
+      "child-bbf43cf65ddb8e4597403e37",
+      "child-83be58b95c8f440bb031dcfe",
+      "child-99826b126b12d42f5d04a467"
+    ],
+    "ground_truth_answer": "An authorized institution's AML/CFT governance framework should include board and senior management oversight, clear policies and procedures, compliance and monitoring functions, customer due diligence, transaction monitoring, recordkeeping, staff training, and independent audit."
+  },
+  {
+    "query": "What core content should AML/CFT staff training cover?",
+    "ground_truth_chunk_ids": [
+      "child-99826b126b12d42f5d04a467",
+      "child-ba855af462153aed8dad875d",
+      "child-99c55298aea535c3b11df956"
+    ],
+    "ground_truth_answer": "AML/CFT staff training should cover the institution's policies, methods for identifying suspicious transactions, internal reporting channels, tipping-off restrictions, and the responsibilities of different roles in the AML/CFT control framework."
+  },
+  {
+    "query": "What training should frontline staff receive on suspicious transaction identification and internal reporting?",
+    "ground_truth_chunk_ids": [
+      "child-ba855af462153aed8dad875d",
+      "child-99826b126b12d42f5d04a467",
+      "child-99c55298aea535c3b11df956"
+    ],
+    "ground_truth_answer": "Frontline staff should receive specific training on identifying suspicious transactions, reporting promptly to the MLRO or designated internal channel, understanding tipping-off risk, and implementing the institution's AML/CFT strategy in customer-facing situations."
+  },
+  {
+    "query": "Why is AML/CFT recordkeeping considered a critical audit trail?",
+    "ground_truth_chunk_ids": [
+      "child-63a56bd9ce2361120cd39e96",
+      "child-ae03c82c4040702a3a021fdc",
+      "child-71797cd2925c9ea8d0328664"
+    ],
+    "ground_truth_answer": "Recordkeeping is a critical part of the AML/CFT audit trail because it helps identify, investigate, and recover criminal or terrorist-related property and allows regulators and law enforcement to reconstruct transactions and customer relationships."
+  },
+  {
+    "query": "What customer due diligence and business relationship records must an institution keep?",
+    "ground_truth_chunk_ids": [
+      "child-bde34c6f1a6235b1314ea904",
+      "child-ae03c82c4040702a3a021fdc",
+      "child-9c1ae00430312bdc513c7ed6"
+    ],
+    "ground_truth_answer": "An institution should keep customer due diligence records, risk assessment materials, significant business correspondence with the customer and beneficial owner, and documents relating to significant changes in customer information to support later review and investigation."
+  },
+  {
+    "query": "If CDD and transaction records are kept outside Hong Kong, what requirements must the institution still satisfy?",
+    "ground_truth_chunk_ids": [
+      "child-781d10b93328e08803fda638",
+      "child-ae03c82c4040702a3a021fdc"
+    ],
+    "ground_truth_answer": "Even if CDD and transaction records are held outside Hong Kong, the authorized institution must still comply with Hong Kong AML/CFT laws and regulatory requirements and ensure the records can be obtained promptly when required by regulators or law enforcement."
+  },
+  {
+    "query": "How should an institution ensure that regulators can obtain AML/CFT records promptly?",
+    "ground_truth_chunk_ids": [
+      "child-781d10b93328e08803fda638",
+      "child-63a56bd9ce2361120cd39e96",
+      "child-14c9570940df02944ccbcaff"
+    ],
+    "ground_truth_answer": "The institution should ensure its recordkeeping arrangements do not hinder Hong Kong regulatory or law-enforcement access, and that relevant records held by internal units, group members, or third parties can be provided promptly when needed."
+  }
+]

@@ -1,5 +1,7 @@
 # RegTech RAG Assistant — 工程架构技术方案
 
+> 当前生产化架构、模型服务、v2 索引迁移和评估门禁以 [PRODUCTION_UPGRADE.md](PRODUCTION_UPGRADE.md) 为准。本文件后续章节保留早期原型设计背景。
+
 > 面试用技术说明书 | 面向 HKMA 合规场景的隐私优先 RAG 系统
 
 ---

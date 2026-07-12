@@ -2,20 +2,22 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import time
 from dataclasses import dataclass
 from typing import Any, Optional, TypedDict
 
 from langgraph.graph import END, StateGraph
 
-from config.settings import Settings, get_anthropic_client, get_settings
+from config.settings import Settings, get_settings
+from src.inference import LLMClient, create_llm_client
+from src.inference.llm_client import LLMError, parse_json_object
 from src.retrieval.query_pipeline import (
     ComplianceRetrievalPipeline,
     RetrievedChunk,
     RetrievalRequest,
     RetrievalResult,
 )
+from src.safety import NLIGroundingVerifier
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +35,13 @@ class AuditState(TypedDict, total=False):
     current_iteration: int  # 1-based iteration counter
     draft_answer: str  # Draftee output (approved draft or revision target)
     audit_feedback: str  # Auditor feedback (empty = approved)
+    audit_status: str  # pending | approved | rejected | error | max_iterations
     claims: list[dict[str, Any]]  # validated claims with source_ids
     cite_sources: list[str]  # human-readable citation labels
     error_message: str
     final_output: str
     token_metrics: dict[str, int]
+    grounding_scores: dict[str, float]
 
 
 @dataclass
@@ -49,6 +53,8 @@ class AuditResult:
     error: Optional[str]
     retrieved_chunks: list[RetrievedChunk] | None = None
     iterations: int = 0
+    audit_status: str = "pending"
+    grounding_scores: dict[str, float] | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -61,6 +67,13 @@ _INSUFFICIENT_EVIDENCE_MSG = (
     "The available regulatory documents do not contain sufficient information "
     "to answer this question reliably. Please rephrase your query or consult "
     "a compliance officer for this specific inquiry."
+)
+
+_UNAUDITED_REPORT_MSG = (
+    "# 本报告未经审计通过\n\n"
+    "The generated draft was blocked because it did not pass the compliance audit "
+    "within the configured iteration limit. Consult a compliance officer and review "
+    "the internal audit trail before using any draft content."
 )
 
 
@@ -148,83 +161,46 @@ class ComplianceAgentGraph:
         self,
         retrieval_pipeline: ComplianceRetrievalPipeline | None = None,
         settings: Settings | None = None,
+        draft_client: LLMClient | None = None,
+        auditor_client: LLMClient | None = None,
+        grounding_verifier: NLIGroundingVerifier | None = None,
     ) -> None:
         self._settings = settings or get_settings()
         self._pipeline = retrieval_pipeline
+        self._draft_client = draft_client or create_llm_client(self._settings.llm_roles.draft, self._settings)
+        self._auditor_client = auditor_client or create_llm_client(self._settings.llm_roles.auditor, self._settings)
+        self._grounding_verifier = grounding_verifier or NLIGroundingVerifier(self._settings)
         self._compiled: Any = None
-
-    @property
-    def _anthropic_client(self) -> Any:
-        return get_anthropic_client(self._settings)
 
     @property
     def _max_iterations(self) -> int:
         return self._settings.retrieval.max_audit_iterations
 
     # ------------------------------------------------------------------
-    # Helper: invoke Claude
+    # Helper: invoke role-specific model
     # ------------------------------------------------------------------
 
-    def _claude_request(self, prompt: str, system_text: str) -> Any:
-        request: dict[str, Any] = {
-            "model": self._settings.llm.model,
-            "max_tokens": self._settings.llm.max_tokens,
-            "system": [
-                {
-                    "type": "text",
-                    "text": system_text,
-                    "cache_control": {"type": "ephemeral"},
-                }
-            ],
-            "messages": [{"role": "user", "content": prompt}],
-            "output_config": {"effort": self._settings.llm.effort},
-        }
-        if self._settings.llm.enable_adaptive_thinking:
-            request["thinking"] = {
-                "type": "adaptive",
-                "display": self._settings.llm.thinking_display,
-            }
-        return self._anthropic_client.messages.create(**request)
+    def _llm_request(self, client: LLMClient, prompt: str, system_text: str) -> Any:
+        return client.complete(system=system_text, prompt=prompt, json_mode=True)
 
     @staticmethod
     def _usage_tokens(response: Any) -> dict[str, int]:
-        usage = getattr(response, "usage", None)
-        if not usage:
-            return {}
         return {
-            "prompt_tokens": usage.input_tokens,
-            "completion_tokens": usage.output_tokens,
-            "total_tokens": usage.input_tokens + usage.output_tokens,
+            "prompt_tokens": int(getattr(response, "prompt_tokens", 0)),
+            "completion_tokens": int(getattr(response, "completion_tokens", 0)),
+            "total_tokens": int(getattr(response, "total_tokens", 0)),
         }
 
     @staticmethod
     def _parse_json_response(text: str) -> dict[str, Any] | None:
-        cleaned = re.sub(r"```(?:json)?\s*", "", text, flags=re.IGNORECASE).replace("```", "").strip()
-        for candidate in (text, cleaned):
-            try:
-                parsed = json.loads(candidate)
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        match = re.search(r"\{.*\}", cleaned, re.DOTALL)
-        if match:
-            try:
-                parsed = json.loads(match.group(0))
-                if isinstance(parsed, dict):
-                    return parsed
-            except json.JSONDecodeError:
-                pass
-        return None
+        try:
+            return parse_json_object(text)
+        except LLMError:
+            return None
 
     @staticmethod
-    def _extract_text(content: list[Any]) -> str:
-        parts: list[str] = []
-        for block in content:
-            block_text = getattr(block, "text", None)
-            if block_text:
-                parts.append(str(block_text))
-        return "\n".join(parts).strip()
+    def _extract_text(response: Any) -> str:
+        return str(getattr(response, "text", "")).strip()
 
     # ------------------------------------------------------------------
     # Node 1 – retrieve (Draftee-Auditor loop entry point)
@@ -241,10 +217,15 @@ class ComplianceAgentGraph:
                 import asyncio as _asyncio
                 import nest_asyncio as _nest
 
-                _nest.apply()
-                retrieval_result = _asyncio.run(self._pipeline.retrieve(
-                    RetrievalRequest(user_query=query)
-                ))
+                try:
+                    loop = _asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = _asyncio.new_event_loop()
+                    _asyncio.set_event_loop(loop)
+                _nest.apply(loop)
+                retrieval_result = loop.run_until_complete(
+                    self._pipeline.retrieve(RetrievalRequest(user_query=query))
+                )
                 chunks = retrieval_result.reranked_chunks
                 logger.info(
                     "retrieve_node → pipeline returned %d reranked chunks (from %d raw, %d fused)",
@@ -354,9 +335,9 @@ class ComplianceAgentGraph:
                     "Do NOT include claims that cannot be traced to a specific chunk."
                 )
 
-            response = self._claude_request(prompt, system_text)
+            response = self._llm_request(self._draft_client, prompt, system_text)
             elapsed_ms = (time.perf_counter() - start) * 1000
-            body = self._extract_text(response.content)
+            body = self._extract_text(response)
             token_delta = self._usage_tokens(response)
             logger.info(
                 "generate_draft_node completed in %.1f ms [prompt=%d, completion=%d, total=%d]",
@@ -422,13 +403,14 @@ class ComplianceAgentGraph:
             draft = str(state.get("draft_answer") or "")
             current_iter = int(state.get("current_iteration", 0))
 
-            # Empty draft → auto-approve (let finalize handle insufficient evidence)
+            # Empty drafts are never approved implicitly.
             if not draft:
-                logger.info("auditor_review_node → empty draft, auto-approved")
+                logger.error("auditor_review_node → empty draft rejected")
                 return {
-                    "audit_feedback": "",
+                    "audit_feedback": "Draft is empty and cannot be audited.",
+                    "audit_status": "error",
                     "current_iteration": current_iter + 1,
-                    "error_message": "",
+                    "error_message": "Auditor rejected an empty draft",
                 }
 
             # Insufficient evidence draft → auto-approve
@@ -436,6 +418,7 @@ class ComplianceAgentGraph:
                 logger.info("auditor_review_node → insufficient evidence draft, auto-approved")
                 return {
                     "audit_feedback": "",
+                    "audit_status": "approved",
                     "current_iteration": current_iter + 1,
                     "error_message": "",
                 }
@@ -480,9 +463,15 @@ class ComplianceAgentGraph:
                 f"## Evidence Context\n{evidence_context}"
             )
 
-            response = self._claude_request(prompt, system_text)
+            response = self._llm_request(self._auditor_client, prompt, system_text)
             elapsed_ms = (time.perf_counter() - start) * 1000
-            body = self._extract_text(response.content)
+            body = self._extract_text(response)
+            token_delta = self._usage_tokens(response)
+            previous_tokens = dict(state.get("token_metrics") or {})
+            accumulated_tokens = {
+                key: previous_tokens.get(key, 0) + token_delta.get(key, 0)
+                for key in set(previous_tokens) | set(token_delta)
+            }
             logger.info(
                 "auditor_review_node completed in %.1f ms [approved determination]",
                 elapsed_ms,
@@ -490,11 +479,15 @@ class ComplianceAgentGraph:
 
             parsed = self._parse_json_response(body)
             if parsed is None:
-                logger.warning("auditor_review_node → non-JSON, defaulting to approval")
-                parsed = {"approved": True, "feedback": ""}
+                raise LLMError("Auditor response was not valid JSON")
 
-            approved = bool(parsed.get("approved", True))
+            approved_value = parsed.get("approved")
+            if not isinstance(approved_value, bool):
+                raise LLMError("Auditor response is missing boolean 'approved'")
+            approved = approved_value
             feedback = str(parsed.get("feedback", "")).strip()
+            if not approved and not feedback:
+                feedback = "Auditor rejected the draft without actionable feedback. Regenerate conservatively."
 
             if approved:
                 logger.info("auditor_review_node → approved (iteration %d)", current_iter + 1)
@@ -503,19 +496,58 @@ class ComplianceAgentGraph:
 
             return {
                 "audit_feedback": "" if approved else feedback,
+                "audit_status": "approved" if approved else "rejected",
                 "current_iteration": current_iter + 1,
+                "token_metrics": accumulated_tokens,
                 "error_message": "",
             }
         except Exception as exc:  # noqa: BLE001
             logger.error("auditor_review_node failed: %s", exc)
             return {
-                "audit_feedback": "",
+                "audit_feedback": f"Auditor failure: {exc}",
+                "audit_status": "error",
                 "current_iteration": int(state.get("current_iteration", 0)) + 1,
                 "error_message": f"Auditor review failed: {exc}",
             }
 
     # ------------------------------------------------------------------
-    # Node 4 – finalize
+    # Node 4 – prose grounding
+    # ------------------------------------------------------------------
+
+    def grounding_check_node(self, state: AuditState) -> dict[str, Any]:
+        if not self._settings.inference.nli_enabled:
+            return {"grounding_scores": {}, "error_message": ""}
+        draft = str(state.get("draft_answer") or "")
+        if _INSUFFICIENT_EVIDENCE_MSG.strip() in draft:
+            return {"grounding_scores": {}, "error_message": ""}
+        try:
+            result = self._grounding_verifier.verify(
+                draft,
+                list(state.get("retrieved_chunks") or []),
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.error("grounding_check_node failed: %s", exc)
+            return {
+                "audit_status": "error",
+                "error_message": f"NLI grounding verification failed: {exc}",
+            }
+        if not result.passed:
+            preview = "; ".join(result.unsupported_sentences[:3])
+            return {
+                "audit_status": "rejected",
+                "audit_feedback": f"Unsupported prose detected by NLI: {preview}",
+                "grounding_scores": result.scores,
+                "error_message": "",
+            }
+        return {"grounding_scores": result.scores, "error_message": ""}
+
+    def _grounding_router(self, state: AuditState) -> str:
+        if state.get("error_message"):
+            return "error_handler"
+        return "finalize"
+
+    # ------------------------------------------------------------------
+    # Node 5 – finalize
     # ------------------------------------------------------------------
 
     def finalize_node(self, state: AuditState) -> dict[str, Any]:
@@ -529,9 +561,17 @@ class ComplianceAgentGraph:
             cite_map = _build_chunk_cite_map(chunks)
             validated_claims, cite_sources = _validate_claims(raw_claims, valid_ids, cite_map)
 
-            # Determine final output: use approved draft, or insufficient evidence / no-answer fallback
-            if draft_answer and _INSUFFICIENT_EVIDENCE_MSG.strip() not in draft_answer:
+            audit_status = str(state.get("audit_status") or "pending")
+            if audit_status == "rejected" and int(state.get("current_iteration", 0)) >= self._max_iterations:
+                audit_status = "max_iterations"
+
+            # Only approved content may cross the user-facing boundary.
+            if audit_status == "approved" and draft_answer and _INSUFFICIENT_EVIDENCE_MSG.strip() not in draft_answer:
                 final_output = draft_answer
+            elif audit_status in {"rejected", "max_iterations"}:
+                final_output = _UNAUDITED_REPORT_MSG
+                validated_claims = []
+                cite_sources = []
             elif not chunks:
                 final_output = _INSUFFICIENT_EVIDENCE_MSG
             else:
@@ -551,6 +591,7 @@ class ComplianceAgentGraph:
                 "final_output": final_output,
                 "claims": validated_claims,
                 "cite_sources": cite_sources,
+                "audit_status": audit_status,
                 "error_message": "",
             }
         except Exception as exc:  # noqa: BLE001
@@ -561,7 +602,7 @@ class ComplianceAgentGraph:
             }
 
     # ------------------------------------------------------------------
-    # Node 5 – error_handler
+    # Node 6 – error_handler
     # ------------------------------------------------------------------
 
     def error_handler_node(self, state: AuditState) -> dict[str, Any]:
@@ -576,6 +617,7 @@ class ComplianceAgentGraph:
             ),
             "claims": [],
             "cite_sources": [],
+            "audit_status": "error",
             "error_message": error_msg,
         }
 
@@ -591,12 +633,11 @@ class ComplianceAgentGraph:
     def _auditor_router(self, state: AuditState) -> str:
         if state.get("error_message"):
             return "error_handler"
-        if not state.get("audit_feedback"):
-            # Empty feedback = approved → finalize
-            return "finalize"
+        if state.get("audit_status") == "approved":
+            return "grounding_check"
         if state.get("current_iteration", 0) >= self._max_iterations:
-            # Max iterations reached → force finalize
-            logger.info("auditor_router → max iterations (%d) reached, forcing finalize", self._max_iterations)
+            state["audit_status"] = "max_iterations"
+            logger.info("auditor_router → max iterations (%d) reached, blocking draft", self._max_iterations)
             return "finalize"
         # Feedback present and iterations remaining → loop back to Draftee
         return "generate_draft"
@@ -613,6 +654,7 @@ class ComplianceAgentGraph:
         builder.add_node("retrieve", self.retrieve_node)
         builder.add_node("generate_draft", self.generate_draft_node)
         builder.add_node("auditor_review", self.auditor_review_node)
+        builder.add_node("grounding_check", self.grounding_check_node)
         builder.add_node("finalize", self.finalize_node)
         builder.add_node("error_handler", self.error_handler_node)
 
@@ -632,9 +674,15 @@ class ComplianceAgentGraph:
             self._auditor_router,
             {
                 "generate_draft": "generate_draft",
+                "grounding_check": "grounding_check",
                 "finalize": "finalize",
                 "error_handler": "error_handler",
             },
+        )
+        builder.add_conditional_edges(
+            "grounding_check",
+            self._grounding_router,
+            {"finalize": "finalize", "error_handler": "error_handler"},
         )
         builder.add_edge("finalize", END)
         builder.add_edge("error_handler", END)
@@ -670,11 +718,13 @@ class ComplianceAgentGraph:
             "current_iteration": 0,
             "draft_answer": "",
             "audit_feedback": "",
+            "audit_status": "pending",
             "claims": [],
             "cite_sources": [],
             "error_message": "",
             "final_output": "",
             "token_metrics": {},
+            "grounding_scores": {},
             **state,
         }
 
@@ -694,6 +744,8 @@ class ComplianceAgentGraph:
         token_metrics = dict(final_state.get("token_metrics") or {})
         error = str(final_state.get("error_message") or "") or None
         iterations = int(final_state.get("current_iteration", 0) or 0)
+        audit_status = str(final_state.get("audit_status") or "pending")
+        grounding_scores = dict(final_state.get("grounding_scores") or {})
         retrieved_chunks = list(final_state.get("retrieved_chunks") or []) or None
 
         return AuditResult(
@@ -704,6 +756,8 @@ class ComplianceAgentGraph:
             error=error,
             retrieved_chunks=retrieved_chunks,
             iterations=iterations,
+            audit_status=audit_status,
+            grounding_scores=grounding_scores,
         )
 
 
