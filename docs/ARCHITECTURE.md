@@ -1,436 +1,415 @@
-# RegTech RAG Assistant — 工程架构技术方案
+# RegTech RAG Assistant - 当前工程架构
 
-> 当前生产化架构、模型服务、v2 索引迁移和评估门禁以 [PRODUCTION_UPGRADE.md](PRODUCTION_UPGRADE.md) 为准。本文件后续章节保留早期原型设计背景。
+> 文档状态：当前架构说明
+> 最近核对：2026-07-15
+> 开发规范：以根目录 [`PROJECT_RULES.md`](../PROJECT_RULES.md) 为唯一权威来源
+> 历史原型：见 [`superpowers/specs/ARCHITECTURE_LEGACY.md`](superpowers/specs/ARCHITECTURE_LEGACY.md)
 
-> 面试用技术说明书 | 面向 HKMA 合规场景的隐私优先 RAG 系统
+本文只描述当前 Milvus、BGE-M3、OpenAI-compatible LLM client、LangGraph 和 PostgreSQL 架构。ChromaDB、MiniLM、早期 Claude 单一接入及编号脚本属于历史原型，不再作为当前实现依据。
 
----
+## 1. 状态定义
 
-## 目录
+为避免把“代码存在”误写成“生产已验证”，本文使用以下状态：
 
-1. [项目概述](#1-项目概述)
-2. [架构全景图](#2-架构全景图)
-3. [五大关键设计决策](#3-五大关键设计决策)
-4. [技术栈与数据流](#4-技术栈与数据流)
-5. [项目文件结构](#5-项目文件结构)
-6. [效果评估](#6-效果评估)
-7. [演进路线](#7-演进路线)
-8. [面试问答要点](#8-面试问答要点)
+| 状态 | 含义 |
+|---|---|
+| 已实现 | 代码、配置或部署定义已经存在 |
+| 已验证 | 已在当前环境完成相应测试或评估 |
+| 待验证 | 已实现，但受硬件、费用或完整评估限制，尚未端到端验收 |
+| 生产目标 | 计划用于生产式部署，不能据此宣称已经上线 |
 
----
+## 2. 项目定位
 
-## 1. 项目概述
+本项目是面向香港银行 AML/CFT 合规场景的 RegTech RAG 助手。系统从 HKMA 公开监管材料中检索证据，为英文、中文及香港混合表达查询生成可追溯回答，并通过审计循环、claim 校验和 NLI 据实性验证降低无依据陈述进入用户结果的风险。
 
-一个面向 **HKMA（香港金融管理局）AML/CFT 合规场景** 的 **隐私优先 RAG（检索增强生成）系统**，从单路向量检索演进为 **自适应混合检索 + Cross-Encoder 重排 + LangGraph 双 Agent 审计闭环**。
+系统是合规研究辅助工具，不替代法律意见、监管裁决或合规人员的最终判断。
 
-### 核心特性
+### 2.1 当前核心能力
 
+- Milvus 稠密与学习型稀疏双路检索。
+- BGE-M3 同时生成 dense embedding 与 native lexical sparse weights。
+- 语义父子切块、200 token overlap、稳定 `chunk_id` 与 `parent_id`。
+- 多语言查询扩展、加权 RRF、可选 Cross-Encoder 重排。
+- 仅在有效重排分数不足时触发的条件 HyDE。
+- 查询规划缓存与并行检索。
+- LangGraph 起草、审查、修订闭环，最多三轮。
+- 审查解析错误和模型失败 fail-closed。
+- 最大轮次阻断及 `本报告未经审计通过` 水印。
+- claims/source 映射与散文正文 NLI grounding。
+- PostgreSQL 审计日志及 Alembic migration；本地仍保留 SQLite 回退。
+- Docker Compose 基础设施、CPU/GPU 推理服务定义与 CI 回归门禁。
+
+## 3. 架构全景
+
+```text
+                         Streamlit / app.py
+                                  |
+                                  v
+                     ComplianceAgentGraph
+                                  |
+             +--------------------+--------------------+
+             |                                         |
+             v                                         v
+ ComplianceRetrievalPipeline                 Draft / Auditor LLM
+             |                                  role-based clients
+             |                                         |
+    +--------+---------+                               v
+    |                  |                     OpenAI-compatible API
+    v                  v                    DeepSeek or local vLLM
+BGE-M3 encoder      Query planner
+dense + sparse      intent / multi-query / HyDE
+    |                  |
+    +--------+---------+
+             |
+             v
+       Milvus hybrid search
+       dense + sparse arms
+             |
+             v
+       weighted RRF fusion
+             |
+             v
+   optional BGE reranker service
+             |
+             v
+       parent context backfill
+             |
+             v
+    draft -> audit -> NLI grounding
+             |
+      approved / blocked / error
+             |
+             v
+ PostgreSQL audit repository
+ (SQLite fallback for local use)
 ```
-输入：用户用自然语言提问合规问题
-输出：带逐条页码引用的审计级合规报告
-约束：所有文档和 embedding 永不出本地
+
+## 4. 核心模块与依赖
+
+| 模块 | 主要文件 | 当前职责 | 状态 |
+|---|---|---|---|
+| 配置 | `config/settings.py` | 模型角色、Milvus、切块、检索、推理和存储配置 | 已实现 |
+| LLM client | `src/inference/llm_client.py` | OpenAI-compatible 与兼容 adapter、统一响应和 JSON 解析 | 已实现 |
+| 语义切块 | `src/indexing/semantic_chunker.py` | 句段边界、父子窗口、overlap、稳定 ID | 已实现/已测试 |
+| BGE-M3 编码 | `src/indexing/milvus_ingest.py` | dense 与 native sparse 一致编码 | 已实现/已验证检索 |
+| Milvus 存储 | `src/indexing/milvus_ingest.py` | collection schema、写入、dense/sparse 查询 | 已实现/已验证检索 |
+| 索引重建 | `src/indexing/rebuild_milvus.py` | v2 collection 重建入口 | 已实现 |
+| 查询规划与检索 | `src/retrieval/query_pipeline.py` | 意图、多查询、RRF、重排、HyDE、父块回填 | 已实现；部分能力待验证 |
+| Agent | `src/agent/graph_agent.py` | 检索、起草、审查、NLI、阻断和最终输出 | 已实现/安全路径已测试 |
+| NLI | `src/safety/nli_grounding.py` | 对散文正文执行 entailment 验证 | 已实现；模型效果待扩充评估 |
+| 审计存储 | `src/storage/*` | PostgreSQL repository 与 SQLite fallback | 已实现 |
+| 数据迁移 | `migrations/*` | Alembic schema migration | 已实现 |
+| 推理微服务 | `services/inference_api/*` | embedding、reranker、NLI HTTP API | 已实现；GPU 拓扑待验证 |
+| 评估 | `src/evaluation/*` | 检索、规划链路、生成评估和回归门禁 | 已实现 |
+| 应用 | `app.py` | Streamlit UI、依赖组装、结果展示和审计落库 | 已实现 |
+
+依赖方向：
+
+```text
+app
+  -> agent
+     -> retrieval -> inference / Milvus
+     -> safety    -> inference service or local model
+  -> storage      -> PostgreSQL or SQLite fallback
+
+indexing   -> inference / Milvus
+evaluation -> retrieval / agent
+all modules -> config
 ```
 
-### 量化指标
+生产模块不得反向依赖 `src/evaluation`；检索层不得依赖 UI 或 Agent；provider-specific 细节不得进入业务节点。
+
+## 5. 索引架构
+
+### 5.1 语义父子切块
+
+当前默认配置：
+
+| 参数 | 默认值 |
+|---|---:|
+| Parent size | 1500 tokens |
+| Child size | 400 tokens |
+| Child overlap | 200 tokens |
+| Chunk version | `semantic-v2` |
+
+切块器在句子和段落边界上建立父块，再从父块生成有 overlap 的子块。父块负责保留完整上下文，子块负责提高检索粒度。
+
+`chunk_id` 基于文档标识、稳定结构路径、块类型和内容生成；同一输入和配置应得到相同 ID。子块保存 `parent_id`，查询命中后可回填父块正文。
+
+### 5.2 BGE-M3 双表示
+
+`BGEM3EmbeddingClient` 对入库和查询使用同一模型接口，输出：
+
+- dense vector：用于语义相似检索。
+- lexical sparse weights：用于学习型词项匹配及语义扩展。
+
+学习型 sparse token ID 与历史 blake2b sparse vector 不兼容，因此使用独立 v2 collection，禁止混写旧 collection。
+
+### 5.3 Milvus collection
+
+当前默认 collection：
+
+```text
+regtech_compliance_chunks_v2
+```
+
+关键字段包括：
+
+- `chunk_id`
+- `parent_id`
+- `chunk_type`
+- `source_file`
+- `page_number`
+- `text`
+- `metadata_json`
+- dense vector
+- sparse vector
+
+默认索引和度量：
+
+| 通道 | 索引 | 度量 |
+|---|---|---|
+| Dense | HNSW | COSINE |
+| Sparse | SPARSE_INVERTED_INDEX | IP |
+
+改变 embedding revision、稀疏编码、向量维度、切块 ID 算法或 schema 时，必须创建新 collection 并重新建立评估基线。
+
+## 6. 查询规划与检索链路
+
+### 6.1 规划阶段
+
+`ComplianceRetrievalPipeline.retrieve()` 执行：
+
+1. 根据查询特征决定是否进行多查询扩展。
+2. 意图分类与多查询生成通过 `asyncio.gather` 并行等待。
+3. Planner 结果进入带 TTL 的进程内缓存。
+4. 原查询始终保留并获得 `2.0` 的默认查询权重。
+
+Planner 使用角色化配置。当前运行环境可通过 OpenAI-compatible 接口接入 DeepSeek；生产目标由本地 Qwen2.5-7B-Instruct/vLLM 承担规划任务。
+
+### 6.2 双路检索与融合
+
+每个查询只检索 `chunk_type == "child"`：
+
+1. BGE-M3 批量生成 dense 与 sparse 表示。
+2. dense/sparse 检索在受 semaphore 限制的并行任务中执行。
+3. 各查询、各通道结果以 weighted RRF 融合。
+4. 默认 dense:sparse 权重保持 `1:1`。
+5. RRF 结果截取候选后进入可选 reranker。
+
+直接检索的 `8:1` 权重实验没有在完整规划链路中超过当前基线，因此没有成为默认配置。
+
+### 6.3 Reranker 与条件 HyDE
+
+Reranker 可通过本地模型或独立服务执行。只有 reranker 存在且产生可比较分数时，HyDE 才允许根据 top score 和 margin 触发。
+
+```text
+无 reranker / 无有效 score -> HyDE 禁用
+score 或 margin 低于阈值     -> 生成 HyDE 假设文档并重新检索
+score 充分                    -> 跳过 HyDE
+```
+
+BGE-Reranker-Large 在当前本机 CPU 环境中单查询耗时超过 8 分钟，75 条全量端到端验证尚未完成。因此 reranker 与条件 HyDE 目前是“已实现、待 GPU 全量验证”，不得描述为已验证的默认收益。
+
+### 6.4 父块回填
+
+重排或 RRF 截断完成后，系统按 `parent_id` 批量读取父块。父块内容替代子块正文进入生成上下文，同时保留：
+
+- 命中 child 的 `chunk_id`
+- `parent_id`
+- 原始 score
+- `matched_child_id`
+- 来源文件和页码
+
+同一父块只回填一次，避免多个相邻子块占用生成上下文。
+
+## 7. LLM 接入架构
+
+### 7.1 通用 client
+
+业务层依赖统一 `LLMClient` 协议，不直接调用 provider SDK。当前支持：
+
+- OpenAI-compatible：DeepSeek、vLLM、TGI 或其他兼容服务。
+- Anthropic adapter：为历史配置保留的兼容路径，不是目标本地部署架构。
+
+每个角色独立配置 `provider`、`model`、`base_url`、API key、temperature、max tokens 和 timeout，因此切换 provider 不需要修改检索或 Agent 业务代码。
+
+### 7.2 角色拆分
+
+| 角色 | 当前可配置运行方式 | 生产目标 |
+|---|---|---|
+| Planner | DeepSeek/OpenAI-compatible | Qwen2.5-7B-Instruct on vLLM |
+| Draft | DeepSeek/OpenAI-compatible | Qwen2.5-72B-Instruct-AWQ on vLLM |
+| Auditor | DeepSeek/OpenAI-compatible | Qwen2.5-72B-Instruct-AWQ on vLLM |
+| Judge | DeepSeek/OpenAI-compatible | Qwen2.5-72B-Instruct-AWQ on vLLM |
+
+本机 8 GB 内存不能运行 70B/72B 4-bit 模型；72B AWQ 双 GPU 配置仅为生产目标。
+
+## 8. LangGraph 审计闭环
+
+当前状态机：
+
+```text
+retrieve
+   |
+   v
+generate_draft <----------------+
+   |                             |
+   v                             |
+auditor_review -- rejected ------+
+   |
+   +-- approved --> grounding_check --> finalize
+   |
+   +-- error -------------------------> error_handler
+   |
+   +-- max iterations ---------------> finalize(blocked)
+```
+
+### 8.1 审查规则
+
+- Auditor 输出必须是 JSON object。
+- `approved` 必须存在且为 boolean。
+- 非法 JSON、字段缺失、调用异常或超时均进入 error 状态，不得默认放行。
+- rejected 且仍有剩余轮次时，反馈返回 Draftee 修订。
+- 最多三轮，达到上限后状态转为 `max_iterations`。
+
+### 8.2 用户输出边界
+
+只有 `audit_status == "approved"` 的草稿可以作为答案返回。
+
+未通过最大轮次时，草稿被阻断，用户仅看到：
+
+```text
+本报告未经审计通过
+```
+
+检索为空时返回证据不足信息。错误路径返回 error 状态、空 claims 和空 citations，不把内部未审计草稿泄漏给用户。
+
+### 8.3 两层据实性校验
+
+1. Claim validation：每条结构化 claim 的 `source_ids` 必须映射到实际检索块；无来源或来源无效的 claim 被移除。
+2. NLI grounding：对散文正文逐句执行多语言 entailment 检查；不通过时拒绝，NLI 调用错误时 fail-closed。
+
+## 9. 审计存储
+
+生产式容器通过 `DATABASE_URL` 使用 PostgreSQL 16，schema 由 Alembic 管理。repository 保存请求、响应状态、迭代次数、token、反馈与证据等审计信息。
+
+`create_transaction_repository()` 的当前选择规则为：
+
+```text
+DATABASE_URL 存在 -> PostgresTransactionRepository
+DATABASE_URL 缺失 -> SQLite TransactionRepository
+```
+
+SQLite 是本地兼容回退，不是目标生产审计存储。生产环境必须设置 `DATABASE_URL` 并先执行 `alembic upgrade head`。
+
+## 10. 部署拓扑
+
+Docker Compose 当前定义：
+
+- `postgres`
+- `etcd`
+- `minio`
+- `milvus`
+- `attu`
+- `streamlit`
+- `planner-llm`
+- `generation-llm`
+- `embedding` / `embedding-cpu`
+- `reranker` / `reranker-cpu`
+- `nli`
+- `migrate`
+
+`app` 和 `gpu` profiles 描述生产式目标拓扑。GPU 模型服务、资源分配及全链路性能仍需在目标硬件验证。详细状态和命令见 [`PRODUCTION_UPGRADE.md`](PRODUCTION_UPGRADE.md)。
+
+## 11. 评估与质量门禁
+
+### 11.1 当前检索基线
+
+基线文件：`src/evaluation/baseline_metrics.json`
 
 | 指标 | 数值 |
-|------|------|
-| 知识库规模 | 91 parent + 263 child 节点 |
-| 检索通道 | Fast Path (< 3s) / Rescue Path (~10s) |
-| 审计闭环 | Draftee→Auditor→Feedback，最多 3 轮迭代 |
-| 隐私合规 | 全链路零外部 API 调用（除最后 Claude 生成环节） |
-| 降级鲁棒性 | 4-tier 模型降级 + 条件 HyDE 触发 |
+|---|---:|
+| Hit@1 | 0.5467 |
+| Hit@3 | 0.7600 |
+| Hit@5 | 0.8667 |
+| Recall@10 | 0.8933 |
+| MRR | 0.6734 |
 
----
+元数据：
 
-## 2. 架构全景图
+- collection：`regtech_compliance_chunks_v2`
+- query count：75
+- 查询集：25 个规范问题的 EN、ZH、HK-mixed 变体
+- mode：conditional multi-query + weighted RRF + parent backfill
+- reranked：false
+- generated at：2026-07-12
 
-```
-                        用户提问
-                           │
-                           ▼
-        ┌──────────────────────────────────────┐
-        │       Adaptive Retrieval Router       │
-        │                                        │
-        │  Fast Path            Rescue Path      │
-        │  Dense → Cross-Encoder  HyDE → Dense  │
-        │  (< 3s)               → Cross-Encoder  │
-        │                       (~10s)           │
-        └──────────┬───────────────┬─────────────┘
-                   │               │
-                   ▼               ▼
-        ┌──────────────────────────────────────┐
-        │   ChromaDB (Parent-Child Index)       │
-        │   91 parent nodes / 263 child nodes   │
-        │   Local HuggingFace embeddings (CPU)  │
-        └──────────────────┬───────────────────┘
-                           │
-                           ▼
-        ┌──────────────────────────────────────┐
-        │         Claude (via API)              │
-        │   4-tier graceful degradation         │
-        │   temperature = 0 (deterministic)     │
-        └──────────────────┬───────────────────┘
-                           │
-              ┌────────────┴────────────┐
-              │                         │
-              ▼                         ▼
-    ┌─────────────────┐     ┌─────────────────────┐
-    │  Single-Pass RAG │     │  Dual-Agent Audit    │
-    │  (Strict/BG mode)│     │  (Audited Report)    │
-    │                  │     │                      │
-    │  检索 → 生成 → 输出│     │  Draftee → Auditor   │
-    │                  │     │     ↑        │        │
-    │                  │     │     └──REJECTED──┘    │
-    │                  │     │  (feedback loop × 3)  │
-    └─────────────────┘     └─────────────────────┘
-                                     │
-                                     ▼
-                          ┌─────────────────────┐
-                          │   Streamlit UI       │
-                          │   Citations + Audit  │
-                          │   Trail + Sidebar    │
-                          └─────────────────────┘
-```
+以上结果不包含 BGE-Reranker-Large 全量重排，不得作为 reranker 或 HyDE 的效果证明。
 
----
+### 11.2 CI
 
-## 3. 五大关键设计决策
+GitHub Actions 当前包含：
 
-### 决策 1：本地 Embedding 而非云 API
+- Python 3.11 compile check。
+- `pytest -q` 单元/集成测试。
+- 当 `reports/candidate_metrics.json` 存在时运行 regression gate。
 
-| 方案 | 精度 | 隐私 | 成本 |
-|------|------|------|------|
-| OpenAI text-embedding-3-large | ⭐⭐⭐ | ❌ 数据上传外部 | 按量计费 |
-| Cohere Embed v3 | ⭐⭐⭐ | ❌ 同上 | 按量计费 |
-| **all-MiniLM-L6-v2 本地 CPU** | ⭐⭐ | ✅ 零外部调用 | 免费 |
+评估 gate 目前是条件执行，不等同于 required branch check。将其升级为强制门禁前，必须确保 candidate 由相同语料、collection 和配置生成。
 
-**选择原因：** 银行合规部门的数据安全红线——敏感监管文档不得离开内网。`sentence-transformers` 在 CPU 上运行，384 维向量对监管文本的语义区分能力经实测验证足够。
+## 12. 当前限制与风险
 
-**面试话术：** "合规部门的硬约束是数据不得离开内网。我用 sentence-transformers 本地运行 embedding，ChromaDB 本地持久化，整个检索链路零外部 API 调用。只有最后的生成环节调用 Claude。"
+1. Reranker 的 CPU 延迟不满足交互式使用，全量验证依赖 GPU 服务。
+2. 没有 reranker score 时 HyDE 必须禁用，因此当前基线不是完整 reranker + HyDE 链路。
+3. DeepSeek 属于外部 API，真实客户数据和内部材料不得在未批准情况下发送。
+4. 本地 Qwen 72B 数据驻留方案未在本机运行验证。
+5. PostgreSQL 代码和 Compose 已具备，但本地未设置 `DATABASE_URL` 时仍会回退 SQLite。
+6. NLI 模型需要更大规模中英文/HK-mixed 标注集校准阈值。
+7. 当前 75 条检索集来自 25 个规范问题，后续应拆分调参与独立验收集。
 
----
+## 13. 当前目录结构
 
-### 决策 2：Parent-Child 分层索引而非 Flat Chunk
-
-**问题：** 等长切块（800 字符 + 150 重叠）会把 `Section 4.1(a)(iii)` 和其上下文拦腰截断。检索命中小碎片，Claude 看到的是一段被割裂的文字。
-
-**方案：**
-
-```
-LlamaIndex HierarchicalNodeParser:
-
-  原始 PDF 页面
-       │
-       ▼
-  Parent Node (1024 tokens)
-  = 完整段落 / 法规条款
-       │
-       ├── Child Node (256 tokens)
-       ├── Child Node (256 tokens)    ← 索引用细粒度碎片
-       └── Child Node (256 tokens)
-
-  检索流程:
-    查询 → 搜 Child（精准匹配、召回率高）
-         → 找到 Child #5
-         → 返回 Parent #3（完整上下文、Claude 能看懂）
-```
-
-**实测效果：** 原版 flat chunk 的检索结果常出现同一页的多个碎片（浪费槽位），parent-child 确保了每条结果都是完整段落。
-
-**面试话术：** "监管文档是层级结构的——一条法规有一级条款、二级细则。等长切块会破坏这种结构。用 LlamaIndex 的 HierarchicalNodeParser 建立父子节点关系，检索小粒度 child 保证召回精度，返回大粒度 parent 保证上下文完整。"
-
----
-
-### 决策 3：Cross-Encoder 重排而非纯向量检索
-
-**问题：** Bi-Encoder（双塔模型）把查询和文档分别编码成向量再算余弦距离——两个向量从未在模型层内"见面"。封面页上的 "Guideline on Anti-Money Laundering" 和正文 Chapter 4 里的 "customer due diligence measures for AML" 在向量空间里可能很近，但封面是废信息。
-
-**方案：**
-
-```
-第一轮 Bi-Encoder（召回）:
-  100 份文档 → 分别编码 → 余弦距离 → Top 10
-  特点: 快（O(n) 向量计算）、粗（无交叉注意力）
-
-第二轮 Cross-Encoder（精排）:
-  Top 10 → 逐对 (查询, 文档) 拼接输入 Transformer
-         → 交叉注意力在所有层交互 → 相关性分数
-  特点: 慢（每对单独推理）、准（查询和文档在模型中"对话"）
-
-最终: Top 3 精排 → 喂给 Claude
-```
-
-**实测效果：** 对比测试中，Cross-Encoder 成功将封面页和术语表从高排位踢到低排位，把 Chapter 3 AML/CFT Systems 从 dense #4 提到 reranked #1。
-
-**面试话术：** "Bi-Encoder 把查询和文档分别编码成向量再算余弦距离——两个向量从未'见面'。Cross-Encoder 把查询和文档拼接输入，在 Transformer 每一层交叉注意力，能捕捉'risk assessment procedures'和'Risk-Based Approach'是同一个意思。代价是每对要单独推理一次，所以只对 Top 10 做。"
-
----
-
-### 决策 4：条件触发 HyDE 而非无脑展开
-
-**问题：** 用户说 "risk assessment procedures for money laundering"，文档里写 "Risk-Based Approach"、"institutional ML/TF risk assessment"。语义鸿沟导致向量检索失败——两者在 embedding 空间中距离偏远。
-
-**方案（HyDE = Hypothetical Document Embeddings）：**
-
-```
-常规路径:
-  用户查询 → embedding → 检索 → 结果（可能失败）
-
-HyDE 路径:
-  用户查询 → Claude 生成假设性法规段落 → embedding → 检索 → 结果
-
-  生成的段落（示例）:
-  "An authorized institution should establish and maintain documented
-   ML/TF risk assessment procedures under a Risk-Based Approach,
-   taking into account customer, product, delivery channel, transaction,
-   and geographic risk factors..."
-  → 这段与 Chapter 2 "Risk-Based Approach" 高度同频 → 检索成功
-```
-
-**关键工程判断：不要对所有查询都用 HyDE。**
-
-```
-条件触发逻辑:
-  Cross-Encoder 检索 → 如果 top-1 得分 ≥ 0
-    → Fast Path（< 3s，直接返回）
-  Cross-Encoder 检索 → 如果 top-1 得分 < 0
-    → Rescue Path（~10s，Claude 展开查询 → 重新检索）
-```
-
-**实测效果：** Q3 "risk assessment procedures" 是三版检索器中唯一能命中 Chapter 2 Risk-Based Approach 的方案。
-
-**面试话术：** "这是整个系统最体现工程判断力的设计。HyDE 本身不新鲜，但我没有无脑给所有查询都加——因为每次调 Claude 展开查询要多 6-7 秒延迟。我做了条件触发：先用 Cross-Encoder 快速路径，如果 top-1 得分 < 0，说明当前检索质量不够，才触发 HyDE 救援路径。这叫 Adaptive HyDE——快查询走快速路，难查询自动救援。"
-
----
-
-### 决策 5：双 Agent 审计闭环而非单轮 RAG
-
-**问题：** 合规场景下，幻觉不是"出错"是"违规"。单程 RAG（检索 → 生成 → 输出）无机制保证 Claude 真正引用了检索到的法规原文，也无机制验证引用的准确性。
-
-**方案：**
-
-```
-              ┌──────────┐
-              │ Retrieve │  ← Cross-Encoder 检索证据
-              └────┬─────┘
-                   │
-                   ▼
-              ┌──────────┐
-         ┌───→│ Draftee  │  ← 基于证据起草合规报告
-         │    │ (起草官) │     "每条事实必须带 [Source: file, Page: X]"
-         │    └────┬─────┘
-         │         │
-         │         ▼
-         │    ┌──────────┐
-         │    │ Auditor  │  ← 逐条审查草稿
-         │    │ (审查官) │     ① 每条事实有源文件+页码?
-         │    └────┬─────┘     ② 是否引用了证据之外的法规?
-         │         │           ③ 是否遗漏了证据中的重要内容?
-         │    ┌────┴────┐
-         │    │ APPROVED?│
-         │    ├─ YES → END ──→ 输出审计合规报告
-         │    └─ NO ─→ audit_feedback
-         │              │
-         └──────────────┘  (最多 3 轮)
-```
-
-**LangGraph 状态机实现：**
-
-- `State`: `{messages, evidence, compliance_draft, audit_feedback, audit_approved, iteration_count}`
-- `retrieve_node`: 调用 Cross-Encoder 检索
-- `draftee_node`: 基于证据 + 审计反馈（如有）生成/修改草稿
-- `auditor_node`: 审查草稿，输出 APPROVED 或 REJECTED + 具体反馈
-- `Conditional Edge`: `audit_approved OR iteration >= 3 → END; else → draftee_node`
-
-**实测效果：** 6 条测试查询全部执行完整审计循环。Auditor 能指出草稿中具体缺失的页码和内容（如"缺少 p.47 非面对面措施"、"缺少 p.22 法人识别要求"），Draftee 逐轮补充完善。
-
-**面试话术：** "合规场景下，幻觉不是'出错'而是'违规'。单程 RAG 无法保证 Claude 一定引用了检索到的法规原文。双 Agent 架构用 LangGraph 状态机实现审计闭环：起草官写报告，审查官逐条核验——每条事实陈述是否带页码？是否引用了检索证据？源文件是否匹配？不通过就退回重写，最多 3 轮。这是把合规审计的'四眼原则'编码进了 AI pipeline。"
-
----
-
-## 4. 技术栈与数据流
-
-### 技术栈
-
-| 层级 | 技术 | 用途 |
-|------|------|------|
-| UI | Streamlit 1.50 | 对话界面、侧边栏、审计面板 |
-| 状态机 | LangGraph 0.6 | 双 Agent 审计闭环 |
-| 生成 | Anthropic Claude SDK 0.109 | 合规报告生成 + 审计 |
-| 检索 | ChromaDB 1.5 + Sentence-Transformers | 向量存储 + 本地 embedding |
-| 重排 | Cross-Encoder (ms-marco-MiniLM-L-6-v2) | 检索结果精排 |
-| 文档解析 | LlamaIndex + PyMuPDF | PDF 加载 + 层级切块 |
-| 查询展开 | HyDE (Claude 生成) | 模糊查询 → 假设性段落 |
-| 依赖管理 | pip + requirements.txt | 可复现环境 |
-| 代码组织 | importlib 模块化导入 | 每个检索器独立文件/独立测试 |
-
-### 完整数据流
-
-```
-1. 用户输入问题
-        │
-2. retrieve_evidence_adaptive()
-   ├── Fast Path: Cross-Encoder 检索 top-5
-   │   └── 如果 top-1 score ≥ 0 → 返回结果
-   └── Rescue Path: HyDE 查询展开 → 重新检索 → 返回结果
-        │
-3. build_api_messages()
-   ├── 拼接最近 12 轮对话历史（纯文本）
-   ├── 拼接检索到的证据块 (E1, E2, E3...)
-   └── 拼接当前回答模式 + 用户问题
-        │
-4. stream_claude_answer()
-   ├── Tier 1: Claude-fable-5 + adaptive thinking + output_config
-   ├── Tier 2: Claude-fable-5 + temperature=0（降级）
-   ├── Tier 3: fallback 模型（备选）
-   └── Tier 4: 最终 fallback
-        │
-5. [审计模式] run_audited_compliance_report()
-   ├── Draftee: 生成合规报告草稿
-   ├── Auditor: 审查引用完整性
-   ├── 条件循环: 最多 3 轮反馈修改
-   └── 输出最终审计报告
-        │
-6. select_citations()
-   ├── 用 regex r"E\d+" 提取回复中的证据引用
-   └── 映射回源文件 + 页码
-        │
-7. Streamlit UI 渲染
-   ├── 聊天历史（含引用标注）
-   ├── 审计轨迹（含 audit trail expander）
-   └── 侧边栏（检索路径、模型状态、降级记录）
-```
-
----
-
-## 5. 项目文件结构
-
-```
+```text
 RegTech-RAG-Assistant/
-├── .gitignore                    # 排除 .env / .venv / chroma_db / *.log
-├── .env                          # API Key + Base URL（不入库）
-├── requirements.txt              # Python 依赖清单
-├── Makefile                      # make build / test / app / app-v2 / app-v3
-│
-├── data/
-│   └── hkma_aml_guidelines.pdf   # HKMA AML/CFT 合规指南 (91页)
-│
-├── chroma_db/                    # ChromaDB 持久化数据（不入库）
-│
-├── 1_build_db.py                 # [Phase 0] 原版 flat chunk 入库
-├── 2_test_db.py                  # [Phase 0] ChromaDB 连接验证
-├── 3_app.py                      # [Phase 0] 原版单路向量检索 Streamlit 应用
-│
-├── 4_llamaindex_ingest.py        # [Phase 1] LlamaIndex 父子文档解析
-│   └── HierarchicalNodeParser: 91 parent + 263 child
-│   └── 写入 ChromaDB collection: regtech_parent_child_docs
-│
-├── 5_hybrid_retrieval.py         # [Phase 2-实验] Dense + BM25 + RRF 混合检索
-│   └── 已弃用（BM25 对监管文档引入噪声）
-│
-├── 6_cross_encoder_retrieval.py  # [Phase 2] Cross-Encoder 重排检索器
-│   └── Dense Top 10 → CrossEncoder 精排 → Top 5
-│   └── 独立可测: python 6_cross_encoder_retrieval.py
-│
-├── 7_hyde_retrieval.py           # [Phase 2B] HyDE 查询展开 + 三路对比基准
-│   └── Dense vs X-Encoder vs HyDE+XE 对比表
-│   └── 条件 Rescue Path 触发逻辑
-│
-├── 8_app.py                      # [Phase 3] 自适应检索 Streamlit 应用
-│   └── Fast/Rescue Path + Cross-Encoder + 条件 HyDE
-│   └── 端口: 8502 (make app-v2)
-│
-├── 9_langgraph_agent.py          # [Phase 4] LangGraph 双 Agent CLI
-│   └── StateGraph: retrieve → draftee → auditor → (conditional loop)
-│   └── 独立可测: python 9_langgraph_agent.py
-│
-├── 10_app.py                     # [Phase 5] 三模式 Streamlit 应用
-│   └── Strict Grounding / Background / Audited Compliance Report
-│   └── Audit trail expander + citation display
-│   └── 端口: 8503 (make app-v3)
-│
-├── compare_retrieval.py          # 检索对比工具（新旧三路对比）
-└── comparison_results.json       # 对比基准数据
+├── PROJECT_RULES.md
+├── app.py
+├── config/
+│   └── settings.py
+├── src/
+│   ├── agent/
+│   ├── evaluation/
+│   ├── indexing/
+│   ├── inference/
+│   ├── retrieval/
+│   ├── safety/
+│   └── storage/
+├── services/
+│   ├── inference_api/
+│   └── migration/
+├── migrations/
+├── tests/
+├── data/raw_pdfs/
+├── docs/
+│   ├── ARCHITECTURE.md
+│   ├── PRODUCTION_UPGRADE.md
+│   └── superpowers/specs/ARCHITECTURE_LEGACY.md
+├── docker-compose.yml
+├── alembic.ini
+└── .github/workflows/ci.yml
 ```
 
-**架构原则：** 每个文件独立可运行、独立可测试。`4_llamaindex_ingest.py` 到 `10_app.py` 通过 importlib 懒加载复用，不修改已有文件。这是微服务思想在 monolith Python 项目中的实践。
+早期编号脚本保留在 `archive/`，不得作为当前应用入口或架构依据。
 
----
+## 14. 架构演进顺序
 
-## 6. 效果评估
+在 `PROJECT_RULES.md` 规定的架构评审和单模块流程下，推荐顺序为：
 
-### 检索质量对比
+1. 持续回归 fail-closed、最大轮次阻断与错误输出边界。
+2. 为 DeepSeek 与 vLLM 角色路由补齐统一契约测试。
+3. 固化 BGE-M3 revision、切块配置和 collection build manifest。
+4. 在 GPU 环境完成 BGE-Reranker-Large 全量评估。
+5. 基于有效 reranker score 完成条件 HyDE 消融和延迟评估。
+6. 验证 PostgreSQL 备份恢复、GPU 推理服务和 required CI gate。
+7. 扩充独立合规验收集并加入人工审阅。
 
-| 查询 | Flat Dense | +Cross-Encoder | +HyDE+XE |
-|------|-----------|---------------|----------|
-| Q1: CDD requirements | ⭐⭐ (p.34, 脱靶) | ⭐⭐⭐ (p.19 Ch.4) | ⭐⭐ (过拟合) |
-| Q2: Section 4.1 AML/CFT | ⭐ (p.3 Overview) | ⭐⭐⭐ (p.14 Ch.3) | ⭐⭐⭐ (p.14 Ch.3) |
-| Q3: risk assessment procedures | ⭐ (p.5 ML stages) | ⭐ (p.90 Glossary) | ⭐⭐⭐ (p.10 Ch.2 RBA) |
-
-### 审计闭环验证
-
-| 查询 | 迭代次数 | 审计结果 | 关键发现 |
-|------|---------|----------|----------|
-| CDD measures | 3 轮 | 全部 REJECTED | Auditor 逐轮找到缺失页码(p.47 中介/p.25 身份验证)，Draftee 逐轮补充 |
-| Identity verification | 3 轮 | 全部 REJECTED | Auditor 要求补充法人识别要求(p.22) |
-| Risk assessment | 1 轮 | APPROVED | 证据弱但引用正确，Auditor 放行 |
-
-### 性能指标
-
-| 指标 | Fast Path | Rescue Path | Audit Mode |
-|------|-----------|-------------|------------|
-| 平均延迟 | 2-3s | 8-12s | 30-90s |
-| Claude 调用次数 | 1 | 2 | 2-7 (含审计循环) |
-| 检索覆盖 | top-5 | top-5 (HyDE) | top-3 |
-
----
-
-## 7. 演进路线
-
-```
-Phase 0: Flat Chunk + 单路向量检索
-    ↓
-Phase 1: LlamaIndex Parent-Child 层级解析
-    ↓
-Phase 2: Cross-Encoder 重排 → 淘汰 BM25
-    ↓
-Phase 2B: Adaptive HyDE 条件查询展开
-    ↓
-Phase 3: 自适应检索 Streamlit 应用 (8_app.py)
-    ↓
-Phase 4: LangGraph 双 Agent CLI (9_langgraph_agent.py)
-    ↓
-Phase 5: 三模式 Streamlit 应用 (10_app.py)
-    ↓
-未来: RAGAS 量化评估 / 多文档知识库 / LangGraph 应用集成
-```
-
----
-
-## 8. 面试问答要点
-
-### Q: 为什么不用 LangChain 全家桶？
-
-> LangChain 适合快速原型，但它的高层抽象在需要精细控制检索行为（如 parent-child 回填、Cross-Encoder 重排、条件 HyDE 触发）时反而是负担。我用 importlib 模块化导入，每个检索器独立文件、独立测试、独立版本管理——这是微服务思想在 monolithic Python 项目里的投射。
-
-### Q: 为什么不用更贵的 embedding 模型？
-
-> 银行合规场景的硬约束是数据不出内网。all-MiniLM-L6-v2 在 CPU 上运行，384 维向量对监管文本的语义区分能力经实测验证足够。如果有 GPU，可以升级到 bge-large-en-v1.5 (1024 维)，但当前方案在精度和隐私之间取得了平衡。
-
-### Q: HyDE 每次都调 Claude，不慢吗？
-
-> 不无脑用。我做了条件门控：Cross-Encoder 检索后如果 top-1 相关性得分 ≥ 0，说明当前检索质量够了，直接走 Fast Path（< 3s）。只有得分 < 0 时才触发 Rescue Path 用 HyDE 展开查询。这种 Adaptive HyDE 设计保证了常见查询的响应速度，同时为困难查询提供了兜底。
-
-### Q: 双 Agent 审计为什么比单轮 RAG 好？
-
-> 合规场景下，幻觉不是"出错"是"违规"。单轮 RAG 无机制保证 Claude 真正引用了检索到的证据。双 Agent 审计把合规业的"四眼原则"编码进 AI 流程——起草官写报告，审查官逐条核验引用完整性。实测中，Auditor 能精确定位草稿中缺失的具体页码和内容。审计闭环确保最终输出的每一条事实都有可追溯的源文件+页码引用。
-
-### Q: 这个系统最大的技术亮点是什么？
-
-> 不是某个单一技术，而是**工程判断力驱动的架构演进**。从 flat chunk 到 parent-child，从纯向量到 Cross-Encoder 重排，从无脑 HyDE 到条件触发，从单轮 RAG 到双 Agent 闭环——每一步都是基于实测数据（不是理论偏好）做出的演进决策。comparison_results.json 里存了每一版的对比基准，可以回溯证明每个设计决策的价值。
-
----
-
-> 生成日期: 2026-06
-> 项目地址: https://github.com/zjlljzzjlljz/RegTech-RAG-Assistant
+涉及 provider 协议、collection schema、安全状态机、评估阈值或生产拓扑的重大变化必须通过 ADR。
