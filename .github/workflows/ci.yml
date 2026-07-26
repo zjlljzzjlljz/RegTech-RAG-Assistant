@@ -16,7 +16,7 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall -q config src app.py
-      - run: pytest -q
+      - run: python -m pytest -q
 
   evaluation-gate:
     runs-on: ubuntu-latest
