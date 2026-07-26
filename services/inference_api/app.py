@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import os
-from functools import lru_cache
+import threading
 from typing import Any
 
 import numpy as np
@@ -15,6 +15,72 @@ USE_FP16 = os.getenv("USE_FP16", "true").lower() == "true"
 DEVICE = int(os.getenv("DEVICE", "0"))
 
 app = FastAPI(title=f"RegTech {SERVICE_MODE} inference")
+
+_READINESS_NOT_STARTED = "not_started"
+_READINESS_LOADING = "loading"
+_READINESS_READY = "ready"
+_READINESS_FAILED = "failed"
+_readiness_state = _READINESS_NOT_STARTED
+_readiness_lock = threading.Lock()
+_model: Any | None = None
+_readiness_generation = 0
+
+
+def _load_model_in_background(generation: int) -> None:
+    global _model, _readiness_state
+    try:
+        model = load_model()
+    except Exception:
+        with _readiness_lock:
+            if generation == _readiness_generation:
+                _model = None
+                _readiness_state = _READINESS_FAILED
+    else:
+        with _readiness_lock:
+            if generation == _readiness_generation:
+                _model = model
+                _readiness_state = _READINESS_READY
+
+
+def _model_load_failed() -> HTTPException:
+    return HTTPException(
+        status_code=503,
+        detail={
+            "status": "failed",
+            "code": "MODEL_LOAD_FAILED",
+            "message": "Model initialization failed",
+        },
+    )
+
+
+def _get_model() -> Any:
+    global _readiness_state
+    with _readiness_lock:
+        if _readiness_state == _READINESS_NOT_STARTED:
+            _readiness_state = _READINESS_LOADING
+            generation = _readiness_generation
+            threading.Thread(
+                target=_load_model_in_background, args=(generation,), daemon=True
+            ).start()
+        state = _readiness_state
+        model = _model
+
+    if state == _READINESS_READY:
+        return model
+    if state == _READINESS_FAILED:
+        raise _model_load_failed()
+    raise HTTPException(
+        status_code=503,
+        detail={"status": "loading", "code": "MODEL_NOT_READY"},
+    )
+
+
+def _reset_readiness_state() -> None:
+    global _model, _readiness_generation, _readiness_state
+    with _readiness_lock:
+        _readiness_generation += 1
+        _readiness_state = _READINESS_NOT_STARTED
+        _model = None
 
 
 class EncodeRequest(BaseModel):
@@ -33,7 +99,6 @@ class NLIRequest(BaseModel):
     hypothesis: str
 
 
-@lru_cache(maxsize=1)
 def load_model() -> Any:
     if SERVICE_MODE == "embedding":
         from FlagEmbedding import BGEM3FlagModel
@@ -52,14 +117,20 @@ def load_model() -> Any:
 
 @app.get("/health")
 def health() -> dict[str, str]:
-    return {"status": "ok", "mode": SERVICE_MODE, "model": MODEL_NAME}
+    return {"status": "ok"}
+
+
+@app.get("/ready")
+def ready() -> dict[str, str]:
+    _get_model()
+    return {"status": "ready", "mode": SERVICE_MODE, "model": "[redacted]"}
 
 
 @app.post("/encode")
 def encode(request: EncodeRequest) -> dict[str, Any]:
     if SERVICE_MODE != "embedding":
         raise HTTPException(status_code=404, detail="Embedding endpoint disabled")
-    result = load_model().encode(
+    result = _get_model().encode(
         request.texts,
         batch_size=request.batch_size,
         max_length=request.max_length,
@@ -83,7 +154,7 @@ def rerank(request: RerankRequest) -> dict[str, Any]:
     if SERVICE_MODE != "reranker":
         raise HTTPException(status_code=404, detail="Rerank endpoint disabled")
     pairs = [[request.query, document] for document in request.documents]
-    raw_scores = load_model().compute_score(pairs, normalize=True)
+    raw_scores = _get_model().compute_score(pairs, normalize=True)
     scores = [float(raw_scores)] if np.isscalar(raw_scores) else [float(value) for value in raw_scores]
     return {"model": MODEL_NAME, "scores": scores}
 
@@ -92,7 +163,7 @@ def rerank(request: RerankRequest) -> dict[str, Any]:
 def nli(request: NLIRequest) -> dict[str, Any]:
     if SERVICE_MODE != "nli":
         raise HTTPException(status_code=404, detail="NLI endpoint disabled")
-    result = load_model()({"text": request.premise, "text_pair": request.hypothesis})
+    result = _get_model()({"text": request.premise, "text_pair": request.hypothesis})
     labels = result[0] if result and isinstance(result[0], list) else result
     entailment = 0.0
     contradiction = 0.0

@@ -1,7 +1,7 @@
 # RegTech RAG Assistant - 当前工程架构
 
 > 文档状态：当前架构说明
-> 最近核对：2026-07-15
+> 最近核对：2026-07-26
 > 开发规范：以根目录 [`PROJECT_RULES.md`](../PROJECT_RULES.md) 为唯一权威来源
 > 历史原型：见 [`superpowers/specs/ARCHITECTURE_LEGACY.md`](superpowers/specs/ARCHITECTURE_LEGACY.md)
 
@@ -305,22 +305,58 @@ SQLite 是本地兼容回退，不是目标生产审计存储。生产环境必�
 
 ## 10. 部署拓扑
 
-Docker Compose 当前定义：
+当前实现明确区分三种拓扑。`DEPLOYMENT_MODE` 默认是 `host`；容器拓扑由 Compose 注入 `api-cpu` 或 `gpu-self-hosted`，并由 `config/settings.py` 校验其内部服务地址和安全开关。
 
-- `postgres`
-- `etcd`
-- `minio`
-- `milvus`
-- `attu`
-- `streamlit`
-- `planner-llm`
-- `generation-llm`
-- `embedding` / `embedding-cpu`
-- `reranker` / `reranker-cpu`
-- `nli`
-- `migrate`
+### 10.1 Host 应用 + 容器基础设施
 
-`app` 和 `gpu` profiles 描述生产式目标拓扑。GPU 模型服务、资源分配及全链路性能仍需在目标硬件验证。详细状态和命令见 [`PRODUCTION_UPGRADE.md`](PRODUCTION_UPGRADE.md)。
+Streamlit 作为宿主机进程运行，基础设施和 CPU inference 由 `api-cpu` profile 中的指定服务提供：
+
+```bash
+docker compose --profile api-cpu up -d \
+  postgres etcd minio milvus embedding-cpu nli-cpu
+streamlit run app.py
+```
+
+宿主机使用发布到 loopback 的地址：PostgreSQL `127.0.0.1:5432`、Milvus `127.0.0.1:19530`、embedding `localhost:8101`、NLI `localhost:8103`。默认 NLI 开启、本地模型 fallback 关闭、reranker 关闭，因此检索是 **hybrid dense+sparse RRF without reranking**。`reranker-cpu` 只属于 `tools` profile 的实验服务，若单独启用则发布为 `localhost:8102`。
+
+### 10.2 API+CPU 容器
+
+```bash
+docker compose --profile api-cpu up -d
+```
+
+`streamlit-api` 通过 Compose 内部 DNS 访问 `postgres:5432`、`milvus:19530`、`embedding-cpu:8000` 和 `nli-cpu:8000`。角色 LLM URL 必须使用 HTTPS、精确主机名 `api.deepseek.com`、显式 `443` 或隐式 HTTPS 端口，且不得包含 URL credentials。Compose 可映射空 key，但 `Settings` 会在启动时拒绝缺少 key 的 API+CPU 配置。CPU embedding/NLI 模型会在 readiness 检查期间加载，可能耗时并占用较多内存；该 CPU 拓扑尚未完成动态性能验证。发送到外部 API 的 prompt 和检索上下文越过本地数据边界，不得包含未经批准的客户、交易或内部材料。
+
+### 10.3 GPU self-hosted 目标
+
+```bash
+docker compose --profile gpu-self-hosted up -d
+```
+
+`streamlit-gpu` 不注入也不要求 DeepSeek key，并通过内部 DNS 连接 `planner-llm:8000`、`generation-llm:8000`、`embedding:8000`、`reranker:8000`、`nli:8000`、`postgres:5432` 和 `milvus:19530`。`generation-llm` 的 `tensor-parallel-size=2` 要求该服务同时可见两块 GPU；planner、embedding、reranker 和 NLI 也各自声明 GPU 请求。Compose 没有指定 device ID 或显式跨服务隔离，因此可能发生显存竞争，必须按目标硬件重新分配。该拓扑未动态验证，不能从当前文件推导固定总卡数或生产容量。
+
+API+CPU 默认发布宿主端口 `8501`，GPU 默认发布 `8502`；两者容器内端口均为 `8501`，可分别通过 `API_CPU_STREAMLIT_PORT` 与 `GPU_STREAMLIT_PORT` 调整。Compose profiles 是可叠加集合，并不互斥。`tools` profile 只承载 Attu 与实验性 `reranker-cpu`。
+
+PostgreSQL、Milvus、MinIO、CPU inference 和 Attu 均只发布到 loopback。裸 Streamlit 没有认证；生产必须增加认证反向代理或 API gateway，并以云防火墙/安全组限制入口。
+
+### 10.4 配置加载边界
+
+优先级为：**进程环境、Compose/cloud/secret 注入 > `.env` > 代码默认值**。
+
+- host 模式由 Python 读取仓库 `.env`，使用 `override=False`，不会覆盖已有进程变量。
+- 容器模式下 Python 不读取 `/app/.env`。
+- Compose 仍可读取宿主环境和仓库 `.env` 做插值，但只把 service `environment` 中显式列出的变量注入容器。
+- 全局 `LLM_PROVIDER`、`LLM_BASE_URL`、`LLM_API_KEY` 可被角色继承；`PLANNER_`、`DRAFT_`、`AUDITOR_`、`JUDGE_` 前缀变量优先覆盖。
+
+### 10.5 服务状态与探针
+
+- Streamlit 的健康检查访问 `/_stcore/health`，同时承担 Compose 当前的运行状态检查。
+- vLLM 服务使用 `/health`；该探针表示 HTTP 服务健康。
+- embedding、reranker 和 NLI 使用 `/ready`。readiness 与业务请求统一经过 single-flight 加载状态机：并发请求共享一次模型加载，业务端点不会重复加载。加载中返回 `503 MODEL_NOT_READY`，加载失败返回 `503 MODEL_LOAD_FAILED`，就绪后返回 redacted model 信息。
+- inference API 的 `/health` 是轻量 liveness，仅返回进程存活，不加载模型，也不代表模型 ready。
+- PostgreSQL、Milvus、etcd 和 MinIO 使用各自的健康检查；Streamlit 服务以 `condition: service_healthy` 等待其依赖。
+
+当前变更只记录部署与配置行为，不涉及 migration、Milvus collection、现有数据或 volume 变更。详细升级和风险清单见 [`PRODUCTION_UPGRADE.md`](PRODUCTION_UPGRADE.md)。
 
 ## 11. 评估与质量门禁
 
@@ -366,6 +402,7 @@ GitHub Actions 当前包含：
 5. PostgreSQL 代码和 Compose 已具备，但本地未设置 `DATABASE_URL` 时仍会回退 SQLite。
 6. NLI 模型需要更大规模中英文/HK-mixed 标注集校准阈值。
 7. 当前 75 条检索集来自 25 个规范问题，后续应拆分调参与独立验收集。
+8. MinIO 为兼容官方 Milvus standalone 仍保留 `minioadmin/minioadmin`；这是云部署阻断项，API+CPU 不能据此称为安全生产就绪。云部署前必须同步更新 MinIO root credentials 与 Milvus `MINIO_ACCESS_KEY_ID`/`MINIO_SECRET_ACCESS_KEY`，通过 secret manager 注入，并验证已有数据访问。本轮未解决该凭据问题。
 
 ## 13. 当前目录结构
 

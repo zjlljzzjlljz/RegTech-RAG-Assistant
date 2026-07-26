@@ -1,7 +1,7 @@
 # Production Upgrade
 
 > 文档状态：生产升级与验证清单
-> 最近核对：2026-07-15
+> 最近核对：2026-07-26
 > 当前架构：[`ARCHITECTURE.md`](ARCHITECTURE.md)
 > 开发规范：[`../PROJECT_RULES.md`](../PROJECT_RULES.md)
 
@@ -16,61 +16,81 @@
 | Parent backfill | 已实现/已进入基线 | 子块命中后按 `parent_id` 回填 |
 | OpenAI-compatible LLM client | 已实现 | 支持 DeepSeek、vLLM、TGI-compatible endpoint |
 | DeepSeek runtime | 已实现/外部 API | 当前低成本运行选项，不满足本地数据驻留目标 |
-| Planner vLLM 7B | 生产目标/待验证 | Qwen2.5-7B-Instruct，单 GPU 配置 |
-| Generation vLLM 72B AWQ | 生产目标/待验证 | Qwen2.5-72B-Instruct-AWQ，双 GPU 配置 |
-| BGE-M3 inference service | 已实现/部分验证 | CPU 服务可用；GPU 服务待目标硬件验证 |
+| Planner vLLM 7B | 生产目标/待验证 | Qwen2.5-7B-Instruct，声明 1 个 GPU 请求；未固定 device ID |
+| Generation vLLM 72B AWQ | 生产目标/待验证 | `tensor-parallel-size=2`，服务需同时看到 2 个 GPU；未验证容量 |
+| BGE-M3 inference service | 已实现/待动态验证 | CPU/GPU 服务结构存在；本次未运行模型或性能测试 |
 | BGE reranker service | 已实现/待验证 | 本机 CPU 单查询超过 8 分钟，未完成 75 条评估 |
 | Conditional HyDE | 已实现/待验证 | 无有效 reranker score 时保持禁用 |
-| NLI service | 已实现/待扩充评估 | fail-closed，需更多多语言标注校准 |
+| NLI service | 已实现/待动态验证 | CPU/GPU 服务结构存在；fail-closed，性能及多语言阈值待验证 |
 | PostgreSQL audit repository | 已实现 | Compose 与 Alembic 已具备；本地可回退 SQLite |
 | CI unit tests | 已实现 | compile check + `pytest -q` |
 | CI retrieval regression gate | 已实现/条件执行 | candidate 文件存在时执行，尚非 required check |
 
 ## 2. Runtime Topology
 
-### 2.1 已实现的 Compose 服务
-
-- `postgres`: PostgreSQL 16 审计存储。
-- `migrate`: Alembic migration 工具容器。
-- `milvus`, `etcd`, `minio`: Milvus standalone 依赖与持久化。
-- `attu`: Milvus 管理界面。
-- `streamlit`: 应用容器，启动前执行 Alembic upgrade。
-- `embedding-cpu`: BGE-M3 CPU 推理服务。
-- `reranker-cpu`: BGE-Reranker-Large CPU 服务，仅适合功能验证或离线实验。
-
-### 2.2 生产目标 GPU 服务
-
-- `planner-llm`: vLLM + Qwen2.5-7B-Instruct。
-- `generation-llm`: vLLM + Qwen2.5-72B-Instruct-AWQ，用于 draft、audit 和 judge。
-- `embedding`: BGE-M3 dense 与 native lexical sparse weights。
-- `reranker`: BGE-Reranker-Large batch inference。
-- `nli`: multilingual entailment verification。
-
-生产式目标启动命令：
+### 2.1 API+CPU 容器模式
 
 ```bash
-docker compose --profile app --profile gpu up -d
+docker compose --profile api-cpu up -d
 ```
 
-该命令需要 NVIDIA Container Toolkit 和足够 GPU 资源。72B AWQ 服务当前配置 `tensor-parallel-size=2`，部署前必须按实际 GPU 显存、模型上下文和并发目标重新核算。
+启动 `streamlit-api`、PostgreSQL、Milvus 依赖、`embedding-cpu` 和 `nli-cpu`。`.env.example` 将 `LLM_API_KEY` 留空；Compose 可以映射空值，但 `Settings` 会拒绝启动，直到未跟踪 `.env`、进程环境或 secret manager 注入真实 key。角色 URL 必须使用 HTTPS、精确主机名 `api.deepseek.com`、端口 `443`（或隐式 HTTPS 端口），且不得包含 URL credentials。容器通过 `postgres`、`milvus`、`embedding-cpu` 和 `nli-cpu` 等内部 DNS 名连接，Python 不隐式读取 `/app/.env`。
 
-### 2.3 本机可执行范围
+CPU embedding 与 CPU NLI 的服务结构、Dockerfile 和 readiness 已存在，但会加载较大的模型，启动可能慢且内存占用高。本次未运行 API 或模型，也未验证吞吐、延迟或资源需求。默认关闭 reranker，检索为 **hybrid dense+sparse RRF without reranking**。`reranker-cpu` 位于 `tools` profile，仅用于实验。
 
-当前本机 8 GB 内存不适合运行 70B/72B 4-bit 模型。可以运行基础设施、应用及部分 CPU 推理服务，但 BGE-Reranker-Large 的 CPU 延迟不满足交互式 SLO。
+外部 DeepSeek API 会接收 prompt 和检索上下文。未经批准的客户身份、交易信息、内部监管材料及其他敏感数据不得跨越该数据边界。
 
-仅启动基础设施：
+### 2.2 GPU self-hosted 目标
 
 ```bash
-docker compose up -d postgres etcd minio milvus attu
+docker compose --profile gpu-self-hosted up -d
 ```
 
-启动 CPU embedding 服务：
+该 profile 不要求 DeepSeek key，包含 `streamlit-gpu`、planner/generation vLLM、GPU embedding、reranker 和 NLI，以及共享基础设施。`generation-llm` 设置 `tensor-parallel-size=2` 并请求 2 个 GPU，因此该服务必须同时看到两块设备。其他推理服务也各自请求 GPU。当前 Compose 只表达资源请求数量，没有 device ID、服务间设备隔离或显存配额；多个服务可能竞争同一设备或显存。
+
+这是一项未动态验证的部署目标。不要把资源请求相加后宣称固定卡数，也不要据此承诺吞吐或可运行性。部署前必须针对实际设备拓扑、显存、驱动、NVIDIA Container Toolkit、上下文长度和并发目标分配设备并验证。
+
+### 2.3 Host 应用模式
 
 ```bash
-docker compose --profile cpu up -d embedding-cpu
+docker compose --profile api-cpu up -d \
+  postgres etcd minio milvus embedding-cpu nli-cpu
+streamlit run app.py
 ```
 
-除离线验证外，不建议在本机启动 `reranker-cpu` 执行完整 75 条评估。
+宿主进程连接 `127.0.0.1:5432` PostgreSQL、`127.0.0.1:19530` Milvus、`localhost:8101` embedding 和 `localhost:8103` NLI。应用入口为 <http://localhost:8501>。`.env.example` 默认 `DEPLOYMENT_MODE=host`、`NLI_ENABLED=true`、`PREFER_LOCAL_INFERENCE_FALLBACK=false` 和 `RERANKER_ENABLED=false`。
+
+API+CPU 默认从宿主 `8501` 进入，GPU 默认从宿主 `8502` 进入；容器内部都监听 `8501`。可通过 `API_CPU_STREAMLIT_PORT` 和 `GPU_STREAMLIT_PORT` 覆盖宿主端口。Profiles 可叠加而非互斥；`tools` 只用于 Attu 和实验性 `reranker-cpu`。
+
+### 2.4 配置优先级与验证
+
+优先级是：**进程环境、Compose/cloud/secret 注入 > `.env` > 代码默认值**。
+
+- host 模式读取仓库 `.env` 且 `override=False`。
+- 容器模式 Python 不读取 `/app/.env`；Compose 仍可用宿主环境或仓库 `.env` 做插值，并仅注入 service 中列出的变量。
+- `api-cpu` 校验所有角色均为 `openai`、主机为 `api.deepseek.com`、API key 非空、CPU inference DNS 正确、NLI 开启、fallback 关闭。
+- `gpu-self-hosted` 校验角色与 inference 内部 DNS、PostgreSQL/Milvus 容器地址、NLI 和 fallback。
+
+在部署前使用 dummy key 执行静态配置检查；`--quiet` 不输出展开后的配置：
+
+```bash
+LLM_API_KEY=dummy docker compose --profile api-cpu config --quiet
+LLM_API_KEY=dummy docker compose --profile gpu-self-hosted config --quiet
+```
+
+GPU 运行时本身不要求该 key；这里只为同一 Compose 文件的静态插值检查提供无敏感值输入。
+
+### 2.5 端口与健康状态
+
+PostgreSQL、Milvus、MinIO、CPU inference 和 Attu 的宿主端口均绑定到 `127.0.0.1`。Streamlit host port 可配置，但裸 Streamlit 没有认证；生产必须置于认证反向代理或 API gateway 后，并用云防火墙/安全组限制入口。
+
+MinIO 为保持官方 Milvus standalone 的同步兼容，当前仍使用 `minioadmin/minioadmin`。本轮不更改它，以免只改一侧导致服务或已有数据访问中断；这不代表凭据风险已解决。该默认凭据是云部署阻断项，API+CPU 不能称为安全生产就绪。云部署前必须同步配置 MinIO root credentials 与 Milvus `MINIO_ACCESS_KEY_ID`/`MINIO_SECRET_ACCESS_KEY`，通过 secret manager 注入，并验证已有数据访问。
+
+Inference API 的 `/health` 是 liveness，不加载模型；`/ready` 与业务请求统一走 single-flight 状态机，并发请求共享一次模型加载，业务端点不会重复加载。加载中或失败返回 503。Compose 的 embedding、reranker、NLI healthcheck 使用 `/ready`。Streamlit 使用 `/_stcore/health`，vLLM 使用 `/health`。
+
+### 2.6 数据与回滚边界
+
+这些 profile 和文档调整不改变 migration、Milvus collection、持久化数据或 Docker volume。停止所选 profile 并切换回 host 或另一 profile 不需要 migration downgrade、collection rebuild 或 volume 转换。
 
 ## 3. LLM Migration
 
@@ -89,7 +109,7 @@ OpenAI-compatible client 允许 DeepSeek 和本地 vLLM 使用同一业务接口
 
 ### 3.2 当前外部 API 运行方式
 
-DeepSeek 可以作为当前低成本 provider。API key 只允许存放在 `.env` 或 secret manager，不得进入 Git、日志或文档。
+DeepSeek 可以作为当前低成本 provider。API key 只允许存放在未跟踪 `.env`、进程环境或 secret manager，不得进入 Git、日志或文档。
 
 使用外部 API 时，不得发送未经批准的客户身份、交易数据或内部监管材料。外部 API 配置不满足本地数据驻留目标。
 
@@ -296,6 +316,8 @@ python -m src.evaluation.regression_gate \
 - [ ] NLI 阈值经过多语言标注集校准。
 - [ ] required CI regression gate 启用。
 - [ ] API key、日志、数据保留与访问控制通过安全审查。
+- [ ] 同步轮换 MinIO root credentials 与 Milvus 对应凭据，通过 secret manager 注入，并验证已有数据访问。
+- [ ] Streamlit 位于认证反向代理/API gateway 后，云防火墙或安全组仅允许授权入口。
 - [ ] 人工合规抽检完成并记录结论。
 
 未完成上述清单前，项目应描述为“生产化原型”或“production-like architecture”，不得描述为已投入监管生产环境。
