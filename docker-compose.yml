@@ -361,6 +361,8 @@ services:
       MODEL_NAME: BAAI/bge-m3
       USE_FP16: "false"
       DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
     ports:
       - "127.0.0.1:8101:8000"
     volumes:
@@ -385,6 +387,8 @@ services:
       MODEL_NAME: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
       USE_FP16: "false"
       DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
     ports:
       - "127.0.0.1:8103:8000"
     volumes:
@@ -409,6 +413,8 @@ services:
       MODEL_NAME: BAAI/bge-reranker-large
       USE_FP16: "false"
       DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
     ports:
       - "127.0.0.1:8102:8000"
     volumes:

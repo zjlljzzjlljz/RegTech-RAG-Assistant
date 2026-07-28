@@ -156,6 +156,15 @@ def test_static_internal_urls_resolve_to_declared_compose_services(services):
                 assert urlparse(value).hostname in services
 
 
+def test_static_cpu_inference_is_offline_ready_and_loopback_bound(services):
+    for name in ("embedding-cpu", "nli-cpu", "reranker-cpu"):
+        service = services[name]
+        assert service["environment"]["HF_HUB_OFFLINE"] == "${HF_HUB_OFFLINE:-0}"
+        assert service["environment"]["TRANSFORMERS_OFFLINE"] == "${TRANSFORMERS_OFFLINE:-0}"
+        assert "/ready" in _healthcheck_url(service)
+        assert all(port.startswith("127.0.0.1") for port in service["ports"])
+
+
 def test_static_inference_healthchecks_gate_on_readiness(services):
     for name in ("embedding-cpu", "nli-cpu", "embedding", "reranker", "nli"):
         healthcheck = services[name]["healthcheck"]

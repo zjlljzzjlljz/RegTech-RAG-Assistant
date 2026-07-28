@@ -38,6 +38,8 @@ docker compose --profile api-cpu up -d
 
 CPU embedding 与 CPU NLI 的服务结构、Dockerfile 和 readiness 已存在，但会加载较大的模型，启动可能慢且内存占用高。本次未运行 API 或模型，也未验证吞吐、延迟或资源需求。默认关闭 reranker，检索为 **hybrid dense+sparse RRF without reranking**。`reranker-cpu` 位于 `tools` profile，仅用于实验。
 
+首次运行需联网补全 Hugging Face 模型缓存。确认 cache 完整后，可显式设置 `HF_HUB_OFFLINE=1` 和 `TRANSFORMERS_OFFLINE=1`，避免启动时访问 Hugging Face 元数据；cache 不完整时离线启动会失败。网络问题不得通过关闭 TLS 校验解决。
+
 外部 DeepSeek API 会接收 prompt 和检索上下文。未经批准的客户身份、交易信息、内部监管材料及其他敏感数据不得跨越该数据边界。
 
 ### 2.2 GPU self-hosted 目标
