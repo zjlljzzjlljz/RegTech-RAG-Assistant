@@ -1,3 +1,21 @@
+x-streamlit-common: &streamlit-common
+  image: python:3.11-slim
+  working_dir: /app
+  command: >-
+    bash -lc "pip install --no-cache-dir -r requirements.txt &&
+    alembic upgrade head &&
+    streamlit run app.py --server.address 0.0.0.0 --server.port 8501"
+  volumes:
+    - ./:/app
+  networks:
+    - regtech-net
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8501/_stcore/health', timeout=5)"]
+    interval: 20s
+    timeout: 10s
+    retries: 10
+    start_period: 60s
+
 services:
   postgres:
     image: postgres:16-alpine
@@ -7,6 +25,8 @@ services:
       POSTGRES_DB: regtech
       POSTGRES_USER: regtech
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-regtech-local}
+    ports:
+      - "127.0.0.1:5432:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -63,8 +83,8 @@ services:
       MINIO_SECRET_KEY: minioadmin
     command: minio server /minio_data --console-address ":9001"
     ports:
-      - "9000:9000"
-      - "9001:9001"
+      - "127.0.0.1:9000:9000"
+      - "127.0.0.1:9001:9001"
     volumes:
       - minio-data:/minio_data
     healthcheck:
@@ -87,8 +107,8 @@ services:
     volumes:
       - milvus-data:/var/lib/milvus
     ports:
-      - "19530:19530"
-      - "9091:9091"
+      - "127.0.0.1:19530:19530"
+      - "127.0.0.1:9091:9091"
     depends_on:
       etcd:
         condition: service_healthy
@@ -110,47 +130,94 @@ services:
     environment:
       MILVUS_URL: milvus:19530
     ports:
-      - "8000:3000"
+      - "127.0.0.1:8000:3000"
+    profiles: ["tools"]
     depends_on:
       milvus:
-        condition: service_started
+        condition: service_healthy
     networks:
       - regtech-net
 
-  streamlit:
-    container_name: regtech-streamlit
-    image: python:3.11-slim
-    working_dir: /app
-    command: >-
-      bash -lc "pip install --no-cache-dir -r requirements.txt &&
-      alembic upgrade head &&
-      streamlit run app.py --server.address 0.0.0.0 --server.port 8501"
+  streamlit-api:
+    <<: *streamlit-common
+    ports:
+      - "${API_CPU_STREAMLIT_PORT:-8501}:8501"
     environment:
+      DEPLOYMENT_MODE: api-cpu
+      MILVUS_HOST: milvus
+      MILVUS_PORT: "19530"
+      STREAMLIT_PORT: "8501"
+      DATABASE_URL: postgresql+psycopg://regtech:${POSTGRES_PASSWORD:-regtech-local}@postgres:5432/regtech
+      LLM_PROVIDER: openai
+      PLANNER_LLM_MODEL: ${PLANNER_LLM_MODEL:-deepseek-chat}
+      PLANNER_LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      PLANNER_LLM_API_KEY: ${LLM_API_KEY:-}
+      DRAFT_LLM_MODEL: ${DRAFT_LLM_MODEL:-deepseek-chat}
+      DRAFT_LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      DRAFT_LLM_API_KEY: ${LLM_API_KEY:-}
+      AUDITOR_LLM_MODEL: ${AUDITOR_LLM_MODEL:-deepseek-chat}
+      AUDITOR_LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      AUDITOR_LLM_API_KEY: ${LLM_API_KEY:-}
+      JUDGE_LLM_MODEL: ${JUDGE_LLM_MODEL:-deepseek-chat}
+      JUDGE_LLM_BASE_URL: ${LLM_BASE_URL:-https://api.deepseek.com}
+      JUDGE_LLM_API_KEY: ${LLM_API_KEY:-}
+      EMBEDDING_SERVICE_URL: http://embedding-cpu:8000
+      NLI_SERVICE_URL: http://nli-cpu:8000
+      NLI_ENABLED: "true"
+      RERANKER_ENABLED: "false"
+      PREFER_LOCAL_INFERENCE_FALLBACK: "false"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      milvus:
+        condition: service_healthy
+      embedding-cpu:
+        condition: service_healthy
+      nli-cpu:
+        condition: service_healthy
+    profiles: ["api-cpu"]
+
+  streamlit-gpu:
+    <<: *streamlit-common
+    ports:
+      - "${GPU_STREAMLIT_PORT:-8502}:8501"
+    environment:
+      DEPLOYMENT_MODE: gpu-self-hosted
       MILVUS_HOST: milvus
       MILVUS_PORT: "19530"
       STREAMLIT_PORT: "8501"
       DATABASE_URL: postgresql+psycopg://regtech:${POSTGRES_PASSWORD:-regtech-local}@postgres:5432/regtech
       LLM_PROVIDER: vllm
+      PLANNER_LLM_MODEL: Qwen/Qwen2.5-7B-Instruct
       PLANNER_LLM_BASE_URL: http://planner-llm:8000/v1
+      DRAFT_LLM_MODEL: Qwen/Qwen2.5-72B-Instruct-AWQ
       DRAFT_LLM_BASE_URL: http://generation-llm:8000/v1
+      AUDITOR_LLM_MODEL: Qwen/Qwen2.5-72B-Instruct-AWQ
       AUDITOR_LLM_BASE_URL: http://generation-llm:8000/v1
+      JUDGE_LLM_MODEL: Qwen/Qwen2.5-72B-Instruct-AWQ
       JUDGE_LLM_BASE_URL: http://generation-llm:8000/v1
       EMBEDDING_SERVICE_URL: http://embedding:8000
       RERANKER_SERVICE_URL: http://reranker:8000
       NLI_SERVICE_URL: http://nli:8000
-    ports:
-      - "8501:8501"
-    volumes:
-      - ./:/app
+      NLI_ENABLED: "true"
+      RERANKER_ENABLED: "true"
+      PREFER_LOCAL_INFERENCE_FALLBACK: "false"
     depends_on:
       postgres:
         condition: service_healthy
       milvus:
-        condition: service_started
-    profiles:
-      - app
-    networks:
-      - regtech-net
+        condition: service_healthy
+      planner-llm:
+        condition: service_healthy
+      generation-llm:
+        condition: service_healthy
+      embedding:
+        condition: service_healthy
+      reranker:
+        condition: service_healthy
+      nli:
+        condition: service_healthy
+    profiles: ["gpu-self-hosted"]
 
   planner-llm:
     image: vllm/vllm-openai:v0.8.5
@@ -161,7 +228,7 @@ services:
       --max-model-len 8192
     volumes:
       - hf-cache:/root/.cache/huggingface
-    profiles: ["gpu"]
+    profiles: ["gpu-self-hosted"]
     deploy:
       resources:
         reservations:
@@ -169,6 +236,12 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 300s
     networks:
       - regtech-net
 
@@ -183,7 +256,7 @@ services:
       --max-model-len 16384
     volumes:
       - hf-cache:/root/.cache/huggingface
-    profiles: ["gpu"]
+    profiles: ["gpu-self-hosted"]
     deploy:
       resources:
         reservations:
@@ -191,6 +264,12 @@ services:
             - driver: nvidia
               count: 2
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 300s
     networks:
       - regtech-net
 
@@ -203,7 +282,7 @@ services:
       MODEL_NAME: BAAI/bge-m3
     volumes:
       - hf-cache:/root/.cache/huggingface
-    profiles: ["gpu"]
+    profiles: ["gpu-self-hosted"]
     deploy:
       resources:
         reservations:
@@ -211,6 +290,64 @@ services:
             - driver: nvidia
               count: 1
               capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
+    networks:
+      - regtech-net
+
+  reranker:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile
+    environment:
+      SERVICE_MODE: reranker
+      MODEL_NAME: BAAI/bge-reranker-large
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu-self-hosted"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
+    networks:
+      - regtech-net
+
+  nli:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile
+    environment:
+      SERVICE_MODE: nli
+      MODEL_NAME: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["gpu-self-hosted"]
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 180s
     networks:
       - regtech-net
 
@@ -224,13 +361,41 @@ services:
       MODEL_NAME: BAAI/bge-m3
       USE_FP16: "false"
       DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
     ports:
-      - "8101:8000"
+      - "127.0.0.1:8101:8000"
     volumes:
       - hf-cache:/root/.cache/huggingface
-    profiles: ["cpu"]
+    profiles: ["api-cpu"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+      start_period: 120s
+    networks:
+      - regtech-net
+
+  nli-cpu:
+    build:
+      context: .
+      dockerfile: services/inference_api/Dockerfile.cpu
+    restart: unless-stopped
+    environment:
+      SERVICE_MODE: nli
+      MODEL_NAME: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
+      USE_FP16: "false"
+      DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
+    ports:
+      - "127.0.0.1:8103:8000"
+    volumes:
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["api-cpu"]
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
       interval: 20s
       timeout: 10s
       retries: 30
@@ -248,57 +413,19 @@ services:
       MODEL_NAME: BAAI/bge-reranker-large
       USE_FP16: "false"
       DEVICE: "-1"
+      HF_HUB_OFFLINE: "${HF_HUB_OFFLINE:-0}"
+      TRANSFORMERS_OFFLINE: "${TRANSFORMERS_OFFLINE:-0}"
     ports:
-      - "8102:8000"
+      - "127.0.0.1:8102:8000"
     volumes:
-      - ${HOME}/.cache/huggingface:/root/.cache/huggingface
-    profiles: ["cpu"]
+      - hf-cache:/root/.cache/huggingface
+    profiles: ["tools"]
     healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      test: ["CMD", "curl", "-f", "http://localhost:8000/ready"]
       interval: 20s
       timeout: 10s
       retries: 30
       start_period: 120s
-    networks:
-      - regtech-net
-
-  reranker:
-    build:
-      context: .
-      dockerfile: services/inference_api/Dockerfile
-    environment:
-      SERVICE_MODE: reranker
-      MODEL_NAME: BAAI/bge-reranker-large
-    volumes:
-      - hf-cache:/root/.cache/huggingface
-    profiles: ["gpu"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
-    networks:
-      - regtech-net
-
-  nli:
-    build:
-      context: .
-      dockerfile: services/inference_api/Dockerfile
-    environment:
-      SERVICE_MODE: nli
-      MODEL_NAME: MoritzLaurer/mDeBERTa-v3-base-mnli-xnli
-    volumes:
-      - hf-cache:/root/.cache/huggingface
-    profiles: ["gpu"]
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: 1
-              capabilities: [gpu]
     networks:
       - regtech-net
 

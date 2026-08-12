@@ -6,6 +6,7 @@ import sys
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
+from urllib.parse import urlparse
 
 from dotenv import load_dotenv
 
@@ -145,7 +146,13 @@ class AppSettings:
 
 
 @dataclass(frozen=True)
+class DeploymentSettings:
+    mode: str
+
+
+@dataclass(frozen=True)
 class Settings:
+    deployment: DeploymentSettings
     paths: PathSettings
     milvus: MilvusSettings
     llm: LLMSettings
@@ -199,11 +206,14 @@ def resolve_project_root() -> Path:
 
 
 
-def load_environment() -> Path:
-    project_root = resolve_project_root()
-    env_path = project_root / ".env"
-    load_dotenv(dotenv_path=env_path, override=True)
-    return env_path
+def load_environment(
+    env_path: Path | None = None, mode: str | None = None
+) -> Path:
+    resolved_path = env_path or resolve_project_root() / ".env"
+    resolved_mode = (mode or os.getenv("DEPLOYMENT_MODE", "host")).strip().lower()
+    if resolved_mode == "host":
+        load_dotenv(dotenv_path=resolved_path, override=False)
+    return resolved_path
 
 
 
@@ -232,7 +242,18 @@ def _resolve_paths(project_root: Path) -> PathSettings:
 @lru_cache(maxsize=1)
 def get_settings() -> Settings:
     ensure_sqlite_compatibility()
-    load_environment()
+    explicit_deployment_mode = os.getenv("DEPLOYMENT_MODE")
+    load_environment(mode=explicit_deployment_mode or "host")
+    deployment_mode = os.getenv("DEPLOYMENT_MODE", "host").strip().lower()
+    if deployment_mode not in {"host", "api-cpu", "gpu-self-hosted"}:
+        raise ConfigurationError(
+            "DEPLOYMENT_MODE must be one of: host, api-cpu, gpu-self-hosted"
+        )
+    if explicit_deployment_mode is None and deployment_mode != "host":
+        raise ConfigurationError(
+            "container deployment modes must be set explicitly in the process "
+            "environment or Compose, not in the project .env"
+        )
     project_root = resolve_project_root()
     paths = _resolve_paths(project_root)
 
@@ -247,13 +268,19 @@ def get_settings() -> Settings:
             provider=provider,
             model=os.getenv(f"{prefix}_LLM_MODEL", provider_default_model),
             base_url=(os.getenv(f"{prefix}_LLM_BASE_URL") or os.getenv("LLM_BASE_URL") or legacy_base_url or "").strip() or None,
-            api_key=(os.getenv(f"{prefix}_LLM_API_KEY") or os.getenv("LLM_API_KEY") or legacy_api_key or "").strip() or None,
+            api_key=(
+                os.environ[f"{prefix}_LLM_API_KEY"]
+                if f"{prefix}_LLM_API_KEY" in os.environ
+                else os.getenv("LLM_API_KEY") or legacy_api_key or ""
+            ).strip()
+            or None,
             max_tokens=int(os.getenv(f"{prefix}_LLM_MAX_TOKENS", str(default_max_tokens))),
             temperature=float(os.getenv(f"{prefix}_LLM_TEMPERATURE", "0")),
             timeout_seconds=int(os.getenv(f"{prefix}_LLM_TIMEOUT_SECONDS", "120")),
         )
 
-    return Settings(
+    settings = Settings(
+        deployment=DeploymentSettings(mode=deployment_mode),
         paths=paths,
         milvus=MilvusSettings(
             host=os.getenv("MILVUS_HOST", "127.0.0.1"),
@@ -344,6 +371,85 @@ def get_settings() -> Settings:
         anthropic_base_url=(os.getenv("ANTHROPIC_BASE_URL") or "").strip() or None,
         anthropic_auth_token=(os.getenv("ANTHROPIC_AUTH_TOKEN") or "").strip() or None,
     )
+    _validate_deployment(settings)
+    return settings
+
+
+def _validate_deployment(settings: Settings) -> None:
+    if settings.deployment.mode == "host":
+        return
+
+    errors: list[str] = []
+    roles = (
+        settings.llm_roles.planner,
+        settings.llm_roles.draft,
+        settings.llm_roles.auditor,
+        settings.llm_roles.judge,
+    )
+    if settings.deployment.mode == "api-cpu":
+        for role in roles:
+            if role.provider != "openai":
+                errors.append("all LLM roles must use provider openai")
+            endpoint = urlparse(role.base_url or "")
+            try:
+                port = endpoint.port
+                valid_port = port in {None, 443}
+            except ValueError:
+                valid_port = False
+            if not (
+                endpoint.scheme == "https"
+                and endpoint.hostname == "api.deepseek.com"
+                and valid_port
+                and endpoint.username is None
+                and endpoint.password is None
+            ):
+                errors.append(
+                    "all LLM roles require a secure DeepSeek HTTPS endpoint"
+                )
+            if not role.api_key:
+                errors.append("all LLM roles require an API key")
+        cpu_services = (
+            ("EMBEDDING_SERVICE_URL", settings.inference.embedding_service_url, "embedding-cpu"),
+            ("NLI_SERVICE_URL", settings.inference.nli_service_url, "nli-cpu"),
+        )
+        for name, service_url, expected_host in cpu_services:
+            if urlparse(service_url or "").hostname != expected_host:
+                errors.append(f"{name} must use hostname {expected_host}")
+        if not settings.inference.nli_enabled:
+            errors.append("NLI_ENABLED must be true")
+        if settings.inference.reranker_enabled:
+            reranker_host = urlparse(settings.inference.reranker_service_url or "").hostname
+            if reranker_host != "reranker-cpu":
+                errors.append("RERANKER_SERVICE_URL must use hostname reranker-cpu")
+    else:
+        expected_hosts = ("planner-llm", "generation-llm", "generation-llm", "generation-llm")
+        for role, expected_host in zip(roles, expected_hosts):
+            if role.provider != "vllm":
+                errors.append("all LLM roles must use provider vllm")
+            if urlparse(role.base_url or "").hostname != expected_host:
+                errors.append(f"LLM role URL must use hostname {expected_host}")
+        for name, service_url, expected_host in (
+            ("EMBEDDING_SERVICE_URL", settings.inference.embedding_service_url, "embedding"),
+            ("RERANKER_SERVICE_URL", settings.inference.reranker_service_url, "reranker"),
+            ("NLI_SERVICE_URL", settings.inference.nli_service_url, "nli"),
+        ):
+            if urlparse(service_url or "").hostname != expected_host:
+                errors.append(f"{name} must use hostname {expected_host}")
+        if not settings.inference.nli_enabled:
+            errors.append("NLI_ENABLED must be true")
+
+    database = urlparse(settings.storage.database_url or "")
+    if database.scheme not in {"postgres", "postgresql", "postgresql+psycopg"} or database.hostname in {None, "localhost", "127.0.0.1"}:
+        errors.append("DATABASE_URL must use non-local PostgreSQL")
+    if settings.milvus.host != "milvus":
+        errors.append("MILVUS_HOST must be milvus")
+    if settings.retrieval.max_audit_iterations <= 0:
+        errors.append("MAX_AUDIT_ITERATIONS must be greater than zero")
+    if settings.inference.prefer_local_fallback:
+        errors.append("PREFER_LOCAL_INFERENCE_FALLBACK must be false in container modes")
+
+    if errors:
+        raise ConfigurationError("; ".join(dict.fromkeys(errors)))
 
 
 def get_anthropic_client(
@@ -383,6 +489,7 @@ def get_anthropic_client(
 __all__ = [
     "AppSettings",
     "ConfigurationError",
+    "DeploymentSettings",
     "InferenceSettings",
     "LLMSettings",
     "LLMRoleSettings",

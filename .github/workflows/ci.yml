@@ -16,17 +16,22 @@ jobs:
           cache: pip
       - run: pip install -r requirements.txt pytest
       - run: python -m compileall -q config src app.py
-      - run: pytest -q
+      - run: python -m pytest -q
 
   evaluation-gate:
-    if: ${{ hashFiles('reports/candidate_metrics.json') != '' }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.11"
-      - run: >-
-          python -m src.evaluation.regression_gate
-          --baseline src/evaluation/baseline_metrics.json
-          --candidate reports/candidate_metrics.json
+      - name: Run evaluation regression gate when metrics exist
+        shell: bash
+        run: |
+          if [[ -f reports/candidate_metrics.json ]]; then
+            python -m src.evaluation.regression_gate \
+              --baseline src/evaluation/baseline_metrics.json \
+              --candidate reports/candidate_metrics.json
+          else
+            echo "Skipping evaluation gate: reports/candidate_metrics.json does not exist."
+          fi
